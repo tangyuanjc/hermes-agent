@@ -876,6 +876,12 @@ class BasePlatformAdapter(ABC):
             if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
                 path = path[1:-1].strip()
             path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
+            lowered_path = path.lower()
+            if (
+                lowered_path in {"<path>", "<file>", "<filepath>", "<screenshot_path>", "<image_path>", "{path}", "{file}"}
+                or (lowered_path.startswith("<") and lowered_path.endswith(">"))
+            ):
+                continue
             if path:
                 media.append((path, has_voice_tag))
 

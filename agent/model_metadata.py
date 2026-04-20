@@ -180,6 +180,8 @@ def _is_custom_endpoint(base_url: str) -> bool:
 _URL_TO_PROVIDER: Dict[str, str] = {
     "api.openai.com": "openai",
     "chatgpt.com": "openai",
+    "api.655147.xyz": "openai",
+    "bao-api.655147.xyz": "openai",
     "api.anthropic.com": "anthropic",
     "api.z.ai": "zai",
     "api.moonshot.ai": "kimi-coding",
@@ -922,7 +924,7 @@ def get_model_context_length(
     # (e.g. claude-opus-4.6 is 1M on Anthropic but 128K on GitHub Copilot).
     # If provider is generic (openrouter/custom/empty), try to infer from URL.
     effective_provider = provider
-    if not effective_provider or effective_provider in ("openrouter", "custom"):
+    if not effective_provider or effective_provider in ("auto", "openrouter", "custom"):
         if base_url:
             inferred = _infer_provider_from_url(base_url)
             if inferred:

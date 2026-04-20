@@ -193,6 +193,28 @@ class TestBrowserVisionAnnotate:
                 cmd_args = args[2] if len(args) > 2 else []
                 assert "--annotate" in cmd_args
 
+    def test_failed_analysis_note_does_not_emit_placeholder_media_tag(self, tmp_path):
+        """Failed browser_vision should not advertise literal MEDIA:<path>."""
+        from tools.browser_tool import browser_vision
+        import json
+
+        screenshot = tmp_path / "shot.png"
+        screenshot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+
+        with (
+            patch("hermes_constants.get_hermes_dir", return_value=tmp_path),
+            patch("tools.browser_tool._cleanup_old_screenshots"),
+            patch("tools.browser_tool._run_browser_command") as mock_cmd,
+            patch("tools.browser_tool.call_llm", side_effect=TimeoutError("Request timed out.")),
+            patch("tools.browser_tool._get_vision_model", return_value="test-model"),
+        ):
+            mock_cmd.return_value = {"success": True, "data": {"path": str(screenshot)}}
+            data = json.loads(browser_vision("describe page", annotate=False, task_id="test"))
+
+        assert data["success"] is False
+        assert data["screenshot_path"] == str(screenshot)
+        assert "MEDIA:<path>" not in data.get("note", "")
+
 
 # ── auto-recording config ────────────────────────────────────────────
 

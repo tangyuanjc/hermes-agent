@@ -169,6 +169,21 @@ class TestFeishuPostParsing(unittest.TestCase):
 
 
 class TestFeishuMessageNormalization(unittest.TestCase):
+    def test_normalize_image_message_sets_reply_placeholder(self):
+        from gateway.platforms.feishu import FALLBACK_IMAGE_TEXT, normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="image",
+            raw_content=json.dumps(
+                {
+                    "image_key": "img_key_123",
+                }
+            ),
+        )
+
+        self.assertEqual(normalized.image_keys, ["img_key_123"])
+        self.assertEqual(normalized.metadata["placeholder_text"], FALLBACK_IMAGE_TEXT)
+
     def test_normalize_merge_forward_preserves_summary_lines(self):
         from gateway.platforms.feishu import normalize_feishu_message
 
@@ -1843,7 +1858,7 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(event.source.chat_type, "group")
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_process_inbound_message_fetches_reply_to_text(self):
+    def test_process_inbound_message_fetches_reply_context(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -1855,7 +1870,9 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._resolve_sender_profile = AsyncMock(
             return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": None}
         )
-        adapter._fetch_message_text = AsyncMock(return_value="父消息内容")
+        adapter._fetch_message_context = AsyncMock(
+            return_value=("父消息内容", ["/tmp/replied-image.png"], ["image/png"])
+        )
         message = SimpleNamespace(
             chat_id="oc_chat",
             thread_id=None,
@@ -1879,6 +1896,8 @@ class TestAdapterBehavior(unittest.TestCase):
         event = adapter._dispatch_inbound_event.await_args.args[0]
         self.assertEqual(event.reply_to_message_id, "om_parent")
         self.assertEqual(event.reply_to_text, "父消息内容")
+        self.assertEqual(event.media_urls, ["/tmp/replied-image.png"])
+        self.assertEqual(event.media_types, ["image/png"])
 
     @patch.dict(os.environ, {}, clear=True)
     def test_send_replies_in_thread_when_thread_metadata_present(self):
@@ -2816,6 +2835,51 @@ class TestGroupMentionAtAll(unittest.TestCase):
         # Allowlisted user — should pass.
         allowed_sender = SimpleNamespace(open_id="ou_allowed", user_id=None)
         self.assertTrue(adapter._should_accept_group_message(message, allowed_sender, ""))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open", "FEISHU_APP_ID": "cli_app"}, clear=True)
+    def test_direct_bot_mention_by_app_id_is_accepted(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(
+            content='{"text":"@Hermes 小J 你在吗"}',
+            mentions=[
+                SimpleNamespace(
+                    id=SimpleNamespace(app_id="cli_app"),
+                    name="Hermes 小J",
+                )
+            ],
+            message_type="text",
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+
+        self.assertTrue(adapter._should_accept_group_message(message, sender_id, ""))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open", "FEISHU_APP_ID": "cli_app"}, clear=True)
+    def test_post_bot_mention_by_app_id_is_accepted(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(
+            content=json.dumps(
+                {
+                    "zh_cn": {
+                        "title": "",
+                        "content": [
+                            [{"tag": "at", "user_name": "Hermes 小J", "app_id": "cli_app"}],
+                            [{"tag": "text", "text": "请处理"}],
+                        ],
+                    }
+                }
+            ),
+            mentions=[],
+            message_type="post",
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+
+        self.assertTrue(adapter._should_accept_group_message(message, sender_id, ""))
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")

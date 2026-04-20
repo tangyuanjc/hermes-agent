@@ -294,6 +294,27 @@ class TestLaunchdPlistRefresh:
         # Should NOT call bootout (nothing to bootout)
         assert not any("bootout" in s for s in cmd_strs)
 
+    def test_launchd_restart_calls_refresh(self, tmp_path, monkeypatch):
+        """launchd_restart refreshes a stale plist before kickstarting."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist>old</plist>")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+
+        calls = []
+
+        def fake_run(cmd, check=False, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_restart()
+
+        cmd_strs = [" ".join(c) for c in calls]
+        assert any("bootout" in s for s in cmd_strs)
+        assert any("bootstrap" in s for s in cmd_strs)
+        assert any("kickstart -k" in s for s in cmd_strs)
+
 
 class TestCmdUpdateLaunchdRestart:
     """cmd_update correctly detects and handles launchd on macOS."""
@@ -311,6 +332,9 @@ class TestCmdUpdateLaunchdRestart:
 
         monkeypatch.setattr(
             gateway_cli, "is_macos", lambda: True,
+        )
+        monkeypatch.setattr(
+            gateway_cli, "is_linux", lambda: False,
         )
         monkeypatch.setattr(
             gateway_cli, "get_launchd_plist_path", lambda: plist_path,
@@ -340,6 +364,9 @@ class TestCmdUpdateLaunchdRestart:
         monkeypatch.setattr(
             gateway_cli, "is_macos", lambda: True,
         )
+        monkeypatch.setattr(
+            gateway_cli, "is_linux", lambda: False,
+        )
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         # plist does NOT exist — no launchd service
         monkeypatch.setattr(
@@ -361,12 +388,46 @@ class TestCmdUpdateLaunchdRestart:
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
+    def test_update_gateway_mode_recovers_unloaded_launchd_service(
+        self, mock_run, _mock_which, capsys, tmp_path, monkeypatch,
+    ):
+        """A gateway-triggered update should re-start launchd even if the job
+        unloaded itself before the restart phase runs."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("<plist/>")
+
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_linux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+
+        mock_run.side_effect = _make_run_side_effect(
+            commit_count="3",
+            launchctl_loaded=False,
+        )
+
+        gateway_args = SimpleNamespace(gateway=True)
+
+        with patch.object(gateway_cli, "launchd_start") as mock_launchd_start, \
+             patch.object(gateway_cli, "launchd_restart") as mock_launchd_restart, \
+             patch.object(gateway_cli, "find_gateway_pids", return_value=[]):
+            cmd_update(gateway_args)
+
+        captured = capsys.readouterr().out
+        assert "Restarted" in captured
+        mock_launchd_start.assert_called_once_with()
+        mock_launchd_restart.assert_not_called()
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
     def test_update_with_systemd_still_restarts_via_systemd(
         self, mock_run, _mock_which, mock_args, capsys, monkeypatch,
     ):
         """On Linux with systemd active, update should restart via systemctl."""
         monkeypatch.setattr(
             gateway_cli, "is_macos", lambda: False,
+        )
+        monkeypatch.setattr(
+            gateway_cli, "is_linux", lambda: True,
         )
 
         mock_run.side_effect = _make_run_side_effect(
@@ -395,6 +456,9 @@ class TestCmdUpdateLaunchdRestart:
         """When no gateway is running, update should skip the restart section entirely."""
         monkeypatch.setattr(
             gateway_cli, "is_macos", lambda: False,
+        )
+        monkeypatch.setattr(
+            gateway_cli, "is_linux", lambda: True,
         )
 
         mock_run.side_effect = _make_run_side_effect(

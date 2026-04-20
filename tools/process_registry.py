@@ -41,7 +41,11 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _sanitize_subprocess_env
+from tools.environments.local import (
+    _find_shell,
+    _normalize_local_cwd,
+    _sanitize_subprocess_env,
+)
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -196,7 +200,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
-            cwd=cwd or os.getcwd(),
+            cwd=_normalize_local_cwd(cwd, fallback=os.getcwd()),
             started_at=time.time(),
         )
 

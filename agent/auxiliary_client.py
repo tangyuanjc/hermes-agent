@@ -1425,6 +1425,7 @@ def get_async_text_auxiliary_client(task: str = ""):
 _VISION_AUTO_PROVIDER_ORDER = (
     "openrouter",
     "nous",
+    "openai-codex",
 )
 
 
@@ -1531,8 +1532,9 @@ def resolve_vision_provider_client(
         # Vision auto-detection order:
         #   1. OpenRouter  (known vision-capable default model)
         #   2. Nous Portal (known vision-capable default model)
-        #   3. Active provider + model (user's main chat config)
-        #   4. Stop
+        #   3. Codex OAuth (Responses API)
+        #   4. Active provider + model (user's main chat config)
+        #   5. Stop
         for candidate in _VISION_AUTO_PROVIDER_ORDER:
             sync_client, default_model = _resolve_strict_vision_backend(candidate)
             if sync_client is not None:

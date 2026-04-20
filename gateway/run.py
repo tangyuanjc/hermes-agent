@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Tuple
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -78,6 +78,61 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from utils import atomic_yaml_write
 _hermes_home = get_hermes_home()
+
+_MEDIA_TAG_RE = re.compile(r"MEDIA:\s*(\S+)")
+_PLACEHOLDER_MEDIA_PATHS = {
+    "<path>",
+    "<file>",
+    "<filepath>",
+    "<screenshot_path>",
+    "<image_path>",
+    "{path}",
+    "{file}",
+}
+
+
+def _normalize_media_tag_path(raw_path: str) -> Optional[str]:
+    """Return a deliverable local media path, ignoring docs placeholders."""
+    path = (raw_path or "").strip().strip("`\"'")
+    path = path.rstrip('",.;:)}]')
+    if not path:
+        return None
+    lowered = path.lower()
+    if lowered in _PLACEHOLDER_MEDIA_PATHS:
+        return None
+    if lowered.startswith("<") and lowered.endswith(">"):
+        return None
+    if not (path.startswith("/") or path.startswith("~/")):
+        return None
+    return path
+
+
+def _iter_media_paths_from_content(content: str):
+    for match in _MEDIA_TAG_RE.finditer(content or ""):
+        path = _normalize_media_tag_path(match.group(1))
+        if path:
+            yield path
+
+
+def _extract_media_tags_from_tool_messages(
+    messages: List[Dict[str, Any]],
+    history_media_paths: set,
+) -> Tuple[List[str], bool]:
+    """Extract new deliverable MEDIA tags from tool/function messages."""
+    media_tags: List[str] = []
+    has_voice_directive = False
+    for msg in messages:
+        if msg.get("role") not in ("tool", "function"):
+            continue
+        content = msg.get("content", "") or ""
+        if "MEDIA:" not in content:
+            continue
+        for path in _iter_media_paths_from_content(content):
+            if path not in history_media_paths:
+                media_tags.append(f"MEDIA:{path}")
+        if "[[audio_as_voice]]" in content:
+            has_voice_directive = True
+    return media_tags, has_voice_directive
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -2040,6 +2095,24 @@ class GatewayRunner:
         # Resolve aliases to canonical name so dispatch only checks canonicals.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
+
+        # Owner-only command guard: sensitive commands restricted to bot owner.
+        _OWNER_ONLY_COMMANDS = {
+            "sethome", "model", "provider", "personality", "yolo",
+            "update", "rollback", "approve", "deny", "reload-mcp",
+        }
+        if canonical in _OWNER_ONLY_COMMANDS:
+            _owner_id = None
+            try:
+                import json as _json
+                _id_path = _hermes_home / "workspace" / "context" / "IDENTITIES.json"
+                if _id_path.exists():
+                    _id_data = _json.loads(_id_path.read_text(encoding="utf-8"))
+                    _owner_id = _id_data.get("owner", {}).get("open_id")
+            except Exception:
+                pass
+            if _owner_id and source.user_id != _owner_id:
+                return f"⛔ /{canonical} 是管理员专属命令，只有 owner 可以执行。"
 
         if canonical == "new":
             return await self._handle_reset_command(event)
@@ -6319,7 +6392,14 @@ class GatewayRunner:
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
+        feishu_group_visual_noise = (
+            source.platform == Platform.FEISHU and source.chat_type != "dm"
+        )
+        tool_progress_enabled = (
+            progress_mode != "off"
+            and source.platform != Platform.WEBHOOK
+            and not feishu_group_visual_noise
+        )
         
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if tool_progress_enabled else None
@@ -6554,7 +6634,7 @@ class GatewayRunner:
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
-            if not _status_adapter:
+            if not _status_adapter or feishu_group_visual_noise:
                 return
             try:
                 asyncio.run_coroutine_threadsafe(
@@ -6692,8 +6772,22 @@ class GatewayRunner:
                     fallback_model=self._fallback_model,
                 )
                 if _cache_lock and _cache is not None:
+                    stale_cached_agent = None
                     with _cache_lock:
+                        stale_cached_agent = _cache.get(session_key, (None, None))[0]
                         _cache[session_key] = (agent, _sig)
+                    if (
+                        stale_cached_agent
+                        and stale_cached_agent is not agent
+                        and stale_cached_agent is not _AGENT_PENDING_SENTINEL
+                    ):
+                        try:
+                            stale_cached_agent.shutdown_memory_provider()
+                        except Exception:
+                            logger.debug(
+                                "Failed to shut down stale cached agent memory provider",
+                                exc_info=True,
+                            )
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
             # Per-message state — callbacks and reasoning config change every
@@ -6788,10 +6882,8 @@ class GatewayRunner:
                 if _hm.get("role") in ("tool", "function"):
                     _hc = _hm.get("content", "")
                     if "MEDIA:" in _hc:
-                        for _match in re.finditer(r'MEDIA:(\S+)', _hc):
-                            _p = _match.group(1).strip().rstrip('",}')
-                            if _p:
-                                _history_media_paths.add(_p)
+                        for _p in _iter_media_paths_from_content(_hc):
+                            _history_media_paths.add(_p)
             
             # Register per-session gateway approval callback so dangerous
             # command approval blocks the agent thread (mirrors CLI input()).
@@ -6925,18 +7017,10 @@ class GatewayRunner:
             # before run_conversation) instead of index slicing. This is safe even
             # when context compression shrinks the message list. (Fixes #160)
             if "MEDIA:" not in final_response:
-                media_tags = []
-                has_voice_directive = False
-                for msg in result.get("messages", []):
-                    if msg.get("role") in ("tool", "function"):
-                        content = msg.get("content", "")
-                        if "MEDIA:" in content:
-                            for match in re.finditer(r'MEDIA:(\S+)', content):
-                                path = match.group(1).strip().rstrip('",}')
-                                if path and path not in _history_media_paths:
-                                    media_tags.append(f"MEDIA:{path}")
-                            if "[[audio_as_voice]]" in content:
-                                has_voice_directive = True
+                media_tags, has_voice_directive = _extract_media_tags_from_tool_messages(
+                    result.get("messages", []),
+                    _history_media_paths,
+                )
                 
                 if media_tags:
                     seen = set()
@@ -7293,8 +7377,11 @@ class GatewayRunner:
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
                         try:
-                            await adapter.send(source.chat_id, first_response,
-                                               metadata=getattr(event, "metadata", None))
+                            await adapter.send(
+                                source.chat_id,
+                                first_response,
+                                metadata=getattr(source, "metadata", None),
+                            )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                 # else: interrupted — discard the interrupted response ("Operation

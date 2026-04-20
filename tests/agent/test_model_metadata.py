@@ -22,6 +22,7 @@ from unittest.mock import patch, MagicMock
 from agent.model_metadata import (
     CONTEXT_PROBE_TIERS,
     DEFAULT_CONTEXT_LENGTHS,
+    _infer_provider_from_url,
     _strip_provider_prefix,
     estimate_tokens_rough,
     estimate_messages_tokens_rough,
@@ -297,6 +298,22 @@ class TestGetModelContextLength:
 
         assert result == 200000
 
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.models_dev.lookup_models_dev_context")
+    def test_655147_openai_compatible_endpoint_uses_openai_models_dev_context(self, mock_lookup, mock_fetch):
+        """OpenAI-compatible 655147 routes should resolve via the OpenAI models.dev registry."""
+        mock_fetch.return_value = {}
+        mock_lookup.return_value = 1_050_000
+
+        result = get_model_context_length(
+            "gpt-5.4",
+            base_url="https://api.655147.xyz/v1",
+            provider="auto",
+        )
+
+        assert result == 1_050_000
+        mock_lookup.assert_called_once_with("openai", "gpt-5.4")
+
 
 # =========================================================================
 # _strip_provider_prefix — Ollama model:tag vs provider:model
@@ -339,6 +356,14 @@ class TestStripProviderPrefix:
                 base_url="http://localhost:11434/v1",
             )
         assert result == 32768
+
+
+class TestInferProviderFromUrl:
+    def test_655147_primary_route_maps_to_openai(self):
+        assert _infer_provider_from_url("https://api.655147.xyz/v1") == "openai"
+
+    def test_655147_bao_route_maps_to_openai(self):
+        assert _infer_provider_from_url("https://bao-api.655147.xyz/v1") == "openai"
 
 
 # =========================================================================

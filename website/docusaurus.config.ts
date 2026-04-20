@@ -90,6 +90,11 @@ const config: Config = {
           position: 'left',
         },
         {
+          to: '/ai-hotboard',
+          label: 'AI 热点看板',
+          position: 'left',
+        },
+        {
           href: 'https://hermes-agent.nousresearch.com',
           label: 'Home',
           position: 'right',

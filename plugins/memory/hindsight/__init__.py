@@ -47,6 +47,53 @@ _PROVIDER_DEFAULT_MODELS = {
 
 
 # ---------------------------------------------------------------------------
+# Config normalization
+# ---------------------------------------------------------------------------
+
+def _normalize_config(raw: dict | None) -> dict:
+    """Normalize profile config across snake_case, camelCase, and legacy banks."""
+    cfg = dict(raw or {})
+
+    if "apiKey" not in cfg and cfg.get("api_key"):
+        cfg["apiKey"] = cfg["api_key"]
+    if "api_key" not in cfg and cfg.get("apiKey"):
+        cfg["api_key"] = cfg["apiKey"]
+
+    if "api_url" not in cfg and cfg.get("apiUrl"):
+        cfg["api_url"] = cfg["apiUrl"]
+    if "apiUrl" not in cfg and cfg.get("api_url"):
+        cfg["apiUrl"] = cfg["api_url"]
+
+    if "llmApiKey" not in cfg and cfg.get("llm_api_key"):
+        cfg["llmApiKey"] = cfg["llm_api_key"]
+    if "llm_api_key" not in cfg and cfg.get("llmApiKey"):
+        cfg["llm_api_key"] = cfg["llmApiKey"]
+
+    banks = cfg.get("banks")
+    if isinstance(banks, dict):
+        bank_cfg = None
+        if isinstance(banks.get("hermes"), dict):
+            bank_cfg = banks["hermes"]
+        else:
+            for candidate in banks.values():
+                if isinstance(candidate, dict):
+                    bank_cfg = candidate
+                    break
+        if isinstance(bank_cfg, dict):
+            if not cfg.get("bank_id"):
+                cfg["bank_id"] = (
+                    bank_cfg.get("bankId")
+                    or bank_cfg.get("bank_id")
+                    or bank_cfg.get("id")
+                    or "hermes"
+                )
+            if not cfg.get("budget") and bank_cfg.get("budget"):
+                cfg["budget"] = bank_cfg["budget"]
+
+    return cfg
+
+
+# ---------------------------------------------------------------------------
 # Dedicated event loop for Hindsight async calls (one per process, reused).
 # Avoids creating ephemeral loops that leak aiohttp sessions.
 # ---------------------------------------------------------------------------
@@ -149,7 +196,7 @@ def _load_config() -> dict:
     profile_path = get_hermes_home() / "hindsight" / "config.json"
     if profile_path.exists():
         try:
-            return json.loads(profile_path.read_text(encoding="utf-8"))
+            return _normalize_config(json.loads(profile_path.read_text(encoding="utf-8")))
         except Exception:
             pass
 
@@ -157,11 +204,11 @@ def _load_config() -> dict:
     legacy_path = Path.home() / ".hindsight" / "config.json"
     if legacy_path.exists():
         try:
-            return json.loads(legacy_path.read_text(encoding="utf-8"))
+            return _normalize_config(json.loads(legacy_path.read_text(encoding="utf-8")))
         except Exception:
             pass
 
-    return {
+    return _normalize_config({
         "mode": os.environ.get("HINDSIGHT_MODE", "cloud"),
         "apiKey": os.environ.get("HINDSIGHT_API_KEY", ""),
         "banks": {
@@ -171,7 +218,7 @@ def _load_config() -> dict:
                 "enabled": True,
             }
         },
-    }
+    })
 
 
 # ---------------------------------------------------------------------------

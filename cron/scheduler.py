@@ -570,6 +570,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
+        _model_cfg = {}
+        _configured_provider = ""
+        _configured_base_url = ""
         try:
             import yaml
             _cfg_path = str(_hermes_home / "config.yaml")
@@ -582,6 +585,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                         model = _model_cfg
                     elif isinstance(_model_cfg, dict):
                         model = _model_cfg.get("default", model)
+                if isinstance(_model_cfg, dict):
+                    _configured_provider = str(_model_cfg.get("provider") or "").strip()
+                    _configured_base_url = str(_model_cfg.get("base_url") or "").strip()
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -620,11 +626,21 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             format_runtime_provider_error,
         )
         try:
-            runtime_kwargs = {
-                "requested": job.get("provider") or os.getenv("HERMES_INFERENCE_PROVIDER"),
-            }
-            if job.get("base_url"):
-                runtime_kwargs["explicit_base_url"] = job.get("base_url")
+            requested_provider = (
+                str(job.get("provider") or "").strip()
+                or _configured_provider
+                or os.getenv("HERMES_INFERENCE_PROVIDER")
+                or ""
+            )
+            runtime_kwargs = {}
+            if requested_provider:
+                runtime_kwargs["requested"] = requested_provider
+
+            explicit_base_url = str(job.get("base_url") or "").strip()
+            if not explicit_base_url and requested_provider.lower() == "custom":
+                explicit_base_url = _configured_base_url
+            if explicit_base_url:
+                runtime_kwargs["explicit_base_url"] = explicit_base_url
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except Exception as exc:
             message = format_runtime_provider_error(exc)

@@ -1218,6 +1218,7 @@ def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float = 5.0):
 def launchd_restart():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
+    refresh_launchd_plist_if_needed()
     # Use kickstart -k so launchd performs an atomic kill+restart.
     # A two-step stop/start from inside the gateway's own process tree
     # would kill the shell before the start command is reached.

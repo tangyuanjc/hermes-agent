@@ -1,6 +1,7 @@
 """Tests for the local persistent shell backend."""
 
 import glob as glob_mod
+from pathlib import Path
 
 import pytest
 
@@ -43,6 +44,20 @@ class TestMergeOutput:
 
 
 class TestLocalOneShotRegression:
+    def test_execute_expands_tilde_cwd(self):
+        env = LocalEnvironment(persistent=False)
+        r = env.execute("pwd", cwd="~")
+        assert r["returncode"] == 0
+        assert r["output"].strip() == str(Path.home())
+        env.cleanup()
+
+    def test_invalid_cwd_falls_back_to_home(self):
+        env = LocalEnvironment(persistent=False)
+        r = env.execute("pwd", cwd="/definitely-missing-hermes-cwd")
+        assert r["returncode"] == 0
+        assert r["output"].strip() == str(Path.home())
+        env.cleanup()
+
     def test_echo(self):
         env = LocalEnvironment(persistent=False)
         r = env.execute("echo hello")
@@ -82,6 +97,15 @@ class TestLocalPersistent:
         e = LocalEnvironment(persistent=True)
         yield e
         e.cleanup()
+
+    def test_initial_cwd_honors_tilde(self):
+        env = LocalEnvironment(cwd="~", persistent=True)
+        try:
+            r = env.execute("pwd")
+            assert r["returncode"] == 0
+            assert r["output"].strip() == str(Path.home())
+        finally:
+            env.cleanup()
 
     def test_echo(self, env):
         r = env.execute("echo hello-persistent")

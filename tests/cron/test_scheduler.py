@@ -840,6 +840,56 @@ class TestRunJobPerJobOverrides:
         assert mock_agent_cls.call_args.kwargs["model"] == "perplexity/sonar-pro"
         fake_db.close.assert_called_once()
 
+    def test_job_without_provider_inherits_config_runtime_over_env_override(self, tmp_path, monkeypatch):
+        config_yaml = tmp_path / "config.yaml"
+        config_yaml.write_text(
+            "model:\n"
+            "  default: gpt-5.4\n"
+            "  provider: custom\n"
+            "  base_url: https://api.655147.xyz/v1\n"
+        )
+        monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openrouter")
+
+        job = {
+            "id": "briefing-job",
+            "name": "briefing",
+            "prompt": "hello",
+            "model": None,
+            "provider": None,
+            "base_url": None,
+        }
+
+        fake_db = MagicMock()
+        fake_runtime = {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "base_url": "https://api.655147.xyz/v1",
+            "api_key": "***",
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_runtime) as runtime_mock, \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert "ok" in output
+        runtime_mock.assert_called_once_with(
+            requested="custom",
+            explicit_base_url="https://api.655147.xyz/v1",
+        )
+        assert mock_agent_cls.call_args.kwargs["model"] == "gpt-5.4"
+        fake_db.close.assert_called_once()
+
 
 class TestRunJobSkillBacked:
     def test_run_job_loads_skill_and_disables_recursive_cron_tools(self, tmp_path):

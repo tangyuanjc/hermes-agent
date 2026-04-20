@@ -1,6 +1,7 @@
 """Local execution environment with interrupt support and non-blocking I/O."""
 
 import glob
+import logging
 import os
 import platform
 import shutil
@@ -129,6 +130,7 @@ def _build_provider_env_blocklist() -> frozenset:
 
 
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
@@ -160,6 +162,32 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             sanitized[key] = value
 
     return sanitized
+
+
+def _normalize_local_cwd(cwd: str | None, *, fallback: str | None = None) -> str:
+    """Resolve user-relative / invalid working directories for local subprocesses."""
+    home = os.path.expanduser("~")
+
+    base_dir = os.path.expanduser(fallback or "") if fallback else ""
+    if base_dir and not os.path.isabs(base_dir):
+        base_dir = os.path.abspath(base_dir)
+    if not base_dir or not os.path.isdir(base_dir):
+        base_dir = home if os.path.isdir(home) else os.getcwd()
+
+    raw = (cwd or "").strip()
+    if not raw:
+        return base_dir
+
+    candidate = os.path.expanduser(raw)
+    if not os.path.isabs(candidate):
+        candidate = os.path.abspath(os.path.join(base_dir, candidate))
+
+    if os.path.isdir(candidate):
+        return candidate
+
+    fallback_dir = home if os.path.isdir(home) else base_dir
+    logger.warning("Invalid local cwd %r, falling back to %s", cwd, fallback_dir)
+    return fallback_dir
 
 
 def _find_bash() -> str:
@@ -328,10 +356,22 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None,
                  persistent: bool = False):
-        super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        normalized_cwd = _normalize_local_cwd(cwd, fallback=os.getcwd())
+        super().__init__(cwd=normalized_cwd, timeout=timeout, env=env)
         self.persistent = persistent
         if self.persistent:
             self._init_persistent_shell()
+
+    def execute(self, command: str, cwd: str = "", *,
+                timeout: int | None = None,
+                stdin_data: str | None = None) -> dict:
+        normalized_cwd = _normalize_local_cwd(cwd, fallback=self.cwd)
+        return super().execute(
+            command,
+            cwd=normalized_cwd,
+            timeout=timeout,
+            stdin_data=stdin_data,
+        )
 
     @property
     def _temp_prefix(self) -> str:
@@ -346,6 +386,7 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
+            cwd=self.cwd,
             env=run_env,
             preexec_fn=None if _IS_WINDOWS else os.setsid,
         )
@@ -379,7 +420,7 @@ class LocalEnvironment(PersistentShellMixin, BaseEnvironment):
     def _execute_oneshot(self, command: str, cwd: str = "", *,
                          timeout: int | None = None,
                          stdin_data: str | None = None) -> dict:
-        work_dir = cwd or self.cwd or os.getcwd()
+        work_dir = _normalize_local_cwd(cwd, fallback=self.cwd)
         effective_timeout = timeout or self.timeout
         exec_command, sudo_stdin = self._prepare_command(command)
 

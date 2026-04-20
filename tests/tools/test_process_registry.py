@@ -240,6 +240,50 @@ class TestPruning:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+    def test_spawn_local_normalizes_tilde_cwd(self, registry):
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["cwd"] = kwargs["cwd"]
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        fake_thread = MagicMock()
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("subprocess.Popen", side_effect=fake_popen), \
+            patch("threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            registry.spawn_local("echo hello", cwd="~")
+
+        assert captured["cwd"] == str(Path.home())
+
+    def test_spawn_local_falls_back_when_cwd_missing(self, registry):
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured["cwd"] = kwargs["cwd"]
+            proc = MagicMock()
+            proc.pid = 4321
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            return proc
+
+        fake_thread = MagicMock()
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("subprocess.Popen", side_effect=fake_popen), \
+            patch("threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"):
+            registry.spawn_local("echo hello", cwd="/definitely-missing-hermes-cwd")
+
+        assert captured["cwd"] == str(Path.home())
+
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
         captured = {}
 
