@@ -1809,6 +1809,77 @@ class TestBuildJobPromptSilentHint:
         assert system_pos < prompt_pos
 
 
+class TestBuildJobPromptCharter:
+    def test_build_job_prompt_injects_charter_before_script_output(self):
+        job = {
+            "prompt": "Decide dispatch actions.",
+            "charter_path": "/tmp/session-charter.md",
+        }
+
+        with patch("cron.scheduler.Path.read_text", return_value="# Charter\n- rule"), \
+             patch("cron.scheduler.Path.exists", return_value=True):
+            prompt = _build_job_prompt(job, prerun_script=(True, "signal payload"))
+
+        assert "## Session Charter" in prompt
+        assert "# Charter" in prompt
+        assert "signal payload" in prompt
+        assert prompt.index("## Session Charter") < prompt.index("## Script Output")
+
+
+class TestRunJobContext:
+    @pytest.fixture(autouse=True)
+    def _stub_runtime_provider(self):
+        fake_runtime = {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "test-key",
+            "source": "stub",
+            "requested_provider": None,
+        }
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=fake_runtime,
+        ):
+            yield
+
+    def test_run_job_sets_terminal_cwd_from_job_context(self, monkeypatch):
+        import cron.scheduler as scheduler
+
+        seen = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                seen["cwd_in_init"] = os.environ.get("TERMINAL_CWD")
+
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 0.0}
+
+            def run_conversation(self, prompt):
+                seen["cwd_in_run"] = os.environ.get("TERMINAL_CWD")
+                return {"final_response": "ok", "messages": []}
+
+        monkeypatch.setenv("TERMINAL_CWD", "/tmp/original")
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+
+        job = {
+            "id": "job_context",
+            "name": "Context Job",
+            "prompt": "Use the queue.",
+            "context_cwd": "/tmp/hermes-home",
+        }
+
+        with patch("run_agent.AIAgent", FakeAgent):
+            success, _, final_response, error = scheduler.run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert seen["cwd_in_init"] == "/tmp/hermes-home"
+        assert seen["cwd_in_run"] == "/tmp/hermes-home"
+        assert os.environ["TERMINAL_CWD"] == "/tmp/original"
+
+
 class TestParseWakeGate:
     """Unit tests for _parse_wake_gate — pure function, no side effects."""
 

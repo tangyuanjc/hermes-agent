@@ -105,3 +105,27 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+
+    def test_create_with_context_cwd_and_charter_template(self, tmp_cron_dir, capsys):
+        cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="every 30m",
+                prompt="Use blackboard loop",
+                name="Blackboard",
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script="paperclip_scan_backlog.py",
+                context_cwd="/Users/tangyuanjc/.hermes",
+                charter_template="/Users/tangyuanjc/.hermes/context/session-charter-template.md",
+            )
+        )
+
+        job = list_jobs()[0]
+        assert job["context_cwd"] == "/Users/tangyuanjc/.hermes"
+        assert job["charter_template"] == "/Users/tangyuanjc/.hermes/context/session-charter-template.md"
+
+        out = capsys.readouterr().out
+        assert "Created job" in out

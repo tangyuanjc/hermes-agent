@@ -496,6 +496,9 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    context_cwd: Optional[str] = None,
+    charter_template: Optional[str] = None,
+    charter_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -540,6 +543,11 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        context_cwd: Legacy TERMINAL_CWD override for blackboard-style cron jobs.
+                     Prefer ``workdir`` for new jobs when the path is a real
+                     project directory that should also load context files.
+        charter_template: Optional session charter template path for audit/config visibility.
+        charter_path: Optional rendered session charter path to inject directly into the prompt.
 
     Returns:
         The created job dict
@@ -574,6 +582,12 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_context_cwd = str(context_cwd).strip() if isinstance(context_cwd, str) else None
+    normalized_context_cwd = normalized_context_cwd or None
+    normalized_charter_template = str(charter_template).strip() if isinstance(charter_template, str) else None
+    normalized_charter_template = normalized_charter_template or None
+    normalized_charter_path = str(charter_path).strip() if isinstance(charter_path, str) else None
+    normalized_charter_path = normalized_charter_path or None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -606,6 +620,9 @@ def create_job(
         "script": normalized_script,
         "no_agent": normalized_no_agent,
         "context_from": context_from,
+        "context_cwd": normalized_context_cwd,
+        "charter_template": normalized_charter_template,
+        "charter_path": normalized_charter_path,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {

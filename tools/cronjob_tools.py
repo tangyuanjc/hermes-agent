@@ -279,6 +279,12 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("context_cwd"):
+        result["context_cwd"] = job["context_cwd"]
+    if job.get("charter_template"):
+        result["charter_template"] = job["charter_template"]
+    if job.get("charter_path"):
+        result["charter_path"] = job["charter_path"]
     return result
 
 
@@ -302,6 +308,9 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    context_cwd: Optional[str] = None,
+    charter_template: Optional[str] = None,
+    charter_path: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -368,6 +377,9 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                context_cwd=_normalize_optional_job_value(context_cwd),
+                charter_template=_normalize_optional_job_value(charter_template),
+                charter_path=_normalize_optional_job_value(charter_path),
             )
             return json.dumps(
                 {
@@ -481,6 +493,12 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
+            if context_cwd is not None:
+                updates["context_cwd"] = _normalize_optional_job_value(context_cwd)
+            if charter_template is not None:
+                updates["charter_template"] = _normalize_optional_job_value(charter_template)
+            if charter_path is not None:
+                updates["charter_path"] = _normalize_optional_job_value(charter_path)
             if no_agent is not None:
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
@@ -634,6 +652,18 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "context_cwd": {
+                "type": "string",
+                "description": "Legacy optional TERMINAL_CWD override for blackboard-style cron jobs. Prefer workdir for new project cron jobs. Jobs with context_cwd run sequentially because TERMINAL_CWD is process-global. On update, pass an empty string to clear."
+            },
+            "charter_template": {
+                "type": "string",
+                "description": "Optional session charter template path for blackboard-style cron jobs. Stored for audit/config visibility. On update, pass an empty string to clear."
+            },
+            "charter_path": {
+                "type": "string",
+                "description": "Optional rendered session charter path to inject into the cron prompt each run. A script may also emit charterPath or charterLatestPath JSON. On update, pass an empty string to clear."
+            },
         },
         "required": ["action"]
     }
@@ -682,6 +712,9 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        context_cwd=args.get("context_cwd"),
+        charter_template=args.get("charter_template"),
+        charter_path=args.get("charter_path"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

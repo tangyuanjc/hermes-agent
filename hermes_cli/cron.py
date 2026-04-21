@@ -175,6 +175,9 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        context_cwd=getattr(args, "context_cwd", None),
+        charter_template=getattr(args, "charter_template", None),
+        charter_path=getattr(args, "charter_path", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -191,6 +194,12 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("context_cwd"):
+        print(f"  Context CWD: {job_data['context_cwd']}")
+    if job_data.get("charter_template"):
+        print(f"  Charter Template: {job_data['charter_template']}")
+    if job_data.get("charter_path"):
+        print(f"  Charter Path: {job_data['charter_path']}")
     print(f"  Next run: {result['next_run_at']}")
     return 0
 
@@ -231,6 +240,9 @@ def cron_edit(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", None),
+        context_cwd=getattr(args, "context_cwd", None),
+        charter_template=getattr(args, "charter_template", None),
+        charter_path=getattr(args, "charter_path", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -250,6 +262,12 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if updated.get("context_cwd"):
+        print(f"  Context CWD: {updated['context_cwd']}")
+    if updated.get("charter_template"):
+        print(f"  Charter Template: {updated['charter_template']}")
+    if updated.get("charter_path"):
+        print(f"  Charter Path: {updated['charter_path']}")
     return 0
 
 

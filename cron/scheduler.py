@@ -835,6 +835,40 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _extract_charter_path(job: dict, prerun_script: Optional[tuple] = None) -> Optional[str]:
+    """Resolve the rendered charter path for a cron run.
+
+    Priority:
+    1. Explicit job ``charter_path``.
+    2. JSON emitted by the pre-run script (``charterPath`` or
+       ``charterLatestPath``).
+    """
+    explicit = str(job.get("charter_path") or "").strip()
+    if explicit:
+        return explicit
+
+    if not prerun_script:
+        return None
+
+    success, script_output = prerun_script
+    if not success or not script_output:
+        return None
+
+    try:
+        payload = json.loads(script_output)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("charterPath", "charterLatestPath"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -848,14 +882,15 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """
     prompt = str(job.get("prompt") or "")
     skills = job.get("skills")
+    charter_path = _extract_charter_path(job, prerun_script=prerun_script)
 
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
-    if script_path:
-        if prerun_script is not None:
-            success, script_output = prerun_script
-        else:
-            success, script_output = _run_job_script(script_path)
+    script_result = prerun_script
+    if script_result is None and script_path:
+        script_result = _run_job_script(script_path)
+    if script_result is not None:
+        success, script_output = script_result
         if success:
             if script_output:
                 prompt = (
@@ -916,6 +951,24 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             except (OSError, PermissionError) as e:
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
+
+    if charter_path:
+        try:
+            charter_text = Path(charter_path).read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            prompt = (
+                "## Session Charter Error\n"
+                "The session charter could not be loaded. Report this to the user.\n\n"
+                f"```\n{charter_path}: {exc}\n```\n\n"
+                f"{prompt}"
+            )
+        else:
+            if charter_text:
+                prompt = (
+                    "## Session Charter\n"
+                    f"{charter_text}\n\n"
+                    f"{prompt}"
+                )
 
     # Always prepend cron execution guidance so the agent knows how
     # delivery works and can suppress delivery when appropriate.
@@ -1247,11 +1300,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     #     .cursorrules from the job's project dir, AND
     #   - the terminal, file, and code-exec tools run commands from there.
     #
-    # tick() serializes workdir-jobs outside the parallel pool, so mutating
-    # os.environ["TERMINAL_CWD"] here is safe for those jobs.  For workdir-less
-    # jobs we leave TERMINAL_CWD untouched — preserves the original behaviour
-    # (skip_context_files=True, tools use whatever cwd the scheduler has).
+    # ``context_cwd`` is a legacy, less-strict alias used by the blackboard
+    # cron loop before ``workdir`` existed.  It still sets TERMINAL_CWD, but
+    # does not get path validation at create time.
+    #
+    # tick() serializes jobs with either workdir or context_cwd outside the
+    # parallel pool, so mutating os.environ["TERMINAL_CWD"] here is safe for
+    # those jobs.  For jobs without either field we leave TERMINAL_CWD
+    # untouched — preserves the original behaviour (skip_context_files=True,
+    # tools use whatever cwd the scheduler has).
     _job_workdir = (job.get("workdir") or "").strip() or None
+    _job_context_cwd = (job.get("context_cwd") or "").strip() or None
     if _job_workdir and not Path(_job_workdir).is_dir():
         # Directory was removed between create-time validation and now.  Log
         # and drop back to old behaviour rather than crashing the job.
@@ -1260,10 +1319,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             job_id, _job_workdir,
         )
         _job_workdir = None
+    _job_terminal_cwd = _job_workdir or _job_context_cwd
     _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
-    if _job_workdir:
-        os.environ["TERMINAL_CWD"] = _job_workdir
-        logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
+    if _job_terminal_cwd:
+        os.environ["TERMINAL_CWD"] = _job_terminal_cwd
+        if _job_workdir:
+            logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
+        else:
+            logger.info("Job '%s': using context_cwd %s", job_id, _job_context_cwd)
 
     try:
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -1445,10 +1508,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             disabled_toolsets=["cronjob", "messaging", "clarify"],
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
-            # HERMES_HOME. When a workdir is configured, also inject project
-            # context files (AGENTS.md / CLAUDE.md / .cursorrules) from there.
-            # Without a workdir, keep cwd context discovery disabled.
-            skip_context_files=not bool(_job_workdir),
+            # HERMES_HOME. When a workdir/context_cwd is configured, also
+            # inject project context files (AGENTS.md / CLAUDE.md /
+            # .cursorrules) from there. Without a cwd override, keep cwd
+            # context discovery disabled.
+            skip_context_files=not bool(_job_terminal_cwd),
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
             platform="cron",
@@ -1615,9 +1679,9 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
     finally:
         # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir; see the setup block
-        # at the top of run_job for the serialization guarantee.
-        if _job_workdir:
+        # only ever mutate it when the job has workdir/context_cwd; see the
+        # setup block at the top of run_job for the serialization guarantee.
+        if _job_terminal_cwd:
             if _prior_terminal_cwd == "_UNSET_":
                 os.environ.pop("TERMINAL_CWD", None)
             else:
@@ -1770,17 +1834,25 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 mark_job_run(job["id"], False, str(e))
                 return False
 
-        # Partition due jobs: those with a per-job workdir mutate
+        # Partition due jobs: those with a per-job cwd override mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —
         # so they MUST run sequentially to avoid corrupting each other.  Jobs
-        # without a workdir leave env untouched and stay parallel-safe.
-        workdir_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # without a cwd override leave env untouched and stay parallel-safe.
+        cwd_jobs = [
+            j
+            for j in due_jobs
+            if (j.get("workdir") or j.get("context_cwd") or "").strip()
+        ]
+        parallel_jobs = [
+            j
+            for j in due_jobs
+            if not (j.get("workdir") or j.get("context_cwd") or "").strip()
+        ]
 
         _results: list = []
 
-        # Sequential pass for workdir jobs.
-        for job in workdir_jobs:
+        # Sequential pass for cwd-mutating jobs.
+        for job in cwd_jobs:
             _ctx = contextvars.copy_context()
             _results.append(_ctx.run(_process_job, job))
 
