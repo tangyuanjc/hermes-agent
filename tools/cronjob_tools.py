@@ -215,6 +215,12 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     }
     if job.get("script"):
         result["script"] = job["script"]
+    if job.get("context_cwd"):
+        result["context_cwd"] = job["context_cwd"]
+    if job.get("charter_template"):
+        result["charter_template"] = job["charter_template"]
+    if job.get("charter_path"):
+        result["charter_path"] = job["charter_path"]
     return result
 
 
@@ -234,6 +240,9 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    context_cwd: Optional[str] = None,
+    charter_template: Optional[str] = None,
+    charter_path: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -271,6 +280,9 @@ def cronjob(
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
+                context_cwd=_normalize_optional_job_value(context_cwd),
+                charter_template=_normalize_optional_job_value(charter_template),
+                charter_path=_normalize_optional_job_value(charter_path),
             )
             return json.dumps(
                 {
@@ -360,6 +372,12 @@ def cronjob(
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
+            if context_cwd is not None:
+                updates["context_cwd"] = _normalize_optional_job_value(context_cwd)
+            if charter_template is not None:
+                updates["charter_template"] = _normalize_optional_job_value(charter_template)
+            if charter_path is not None:
+                updates["charter_path"] = _normalize_optional_job_value(charter_path)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -459,6 +477,18 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": f"Optional path to a Python script that runs before each cron job execution. Its stdout is injected into the prompt as context. Use for data collection and change detection. Relative paths resolve under {display_hermes_home()}/scripts/. On update, pass empty string to clear."
             },
+            "context_cwd": {
+                "type": "string",
+                "description": "Optional TERMINAL_CWD override for the cron session so context files are loaded from the intended workspace."
+            },
+            "charter_template": {
+                "type": "string",
+                "description": "Optional session charter template path for blackboard-style cron jobs."
+            },
+            "charter_path": {
+                "type": "string",
+                "description": "Optional rendered session charter path to inject into the cron prompt."
+            },
         },
         "required": ["action"]
     }
@@ -503,6 +533,9 @@ registry.register(
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),
+        context_cwd=args.get("context_cwd"),
+        charter_template=args.get("charter_template"),
+        charter_path=args.get("charter_path"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

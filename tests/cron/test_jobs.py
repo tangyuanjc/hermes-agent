@@ -233,6 +233,22 @@ class TestJobCRUD:
         job = create_job(prompt="Test", schedule="30m")
         assert job["deliver"] == "local"
 
+    def test_create_job_persists_context_cwd_and_charter_template(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Blackboard loop",
+            schedule="every 30m",
+            script="paperclip_scan_backlog.py",
+            context_cwd="/Users/tangyuanjc/.hermes",
+            charter_template="/Users/tangyuanjc/.hermes/context/session-charter-template.md",
+        )
+
+        assert job["context_cwd"] == "/Users/tangyuanjc/.hermes"
+        assert job["charter_template"] == "/Users/tangyuanjc/.hermes/context/session-charter-template.md"
+
+        fetched = get_job(job["id"])
+        assert fetched["context_cwd"] == "/Users/tangyuanjc/.hermes"
+        assert fetched["charter_template"] == "/Users/tangyuanjc/.hermes/context/session-charter-template.md"
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):

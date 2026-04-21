@@ -384,6 +384,9 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    context_cwd: Optional[str] = None,
+    charter_template: Optional[str] = None,
+    charter_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -403,6 +406,9 @@ def create_job(
         script: Optional path to a Python script whose stdout is injected into the
                 prompt each run.  The script runs before the agent turn, and its output
                 is prepended as context.  Useful for data collection / change detection.
+        context_cwd: Optional cwd to expose to the spawned cron session via TERMINAL_CWD
+        charter_template: Optional session charter template path for audit/config visibility
+        charter_path: Optional rendered session charter path to inject directly into the prompt
 
     Returns:
         The created job dict
@@ -433,6 +439,12 @@ def create_job(
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    normalized_context_cwd = str(context_cwd).strip() if isinstance(context_cwd, str) else None
+    normalized_context_cwd = normalized_context_cwd or None
+    normalized_charter_template = str(charter_template).strip() if isinstance(charter_template, str) else None
+    normalized_charter_template = normalized_charter_template or None
+    normalized_charter_path = str(charter_path).strip() if isinstance(charter_path, str) else None
+    normalized_charter_path = normalized_charter_path or None
 
     label_source = (prompt or (normalized_skills[0] if normalized_skills else None)) or "cron job"
     job = {
@@ -445,6 +457,9 @@ def create_job(
         "provider": normalized_provider,
         "base_url": normalized_base_url,
         "script": normalized_script,
+        "context_cwd": normalized_context_cwd,
+        "charter_template": normalized_charter_template,
+        "charter_path": normalized_charter_path,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {

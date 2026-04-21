@@ -6915,6 +6915,21 @@ For more help on a command:
         "--script",
         help="Path to a Python script whose stdout is injected into the prompt each run",
     )
+    cron_create.add_argument(
+        "--context-cwd",
+        dest="context_cwd",
+        help="Optional TERMINAL_CWD override for the cron session",
+    )
+    cron_create.add_argument(
+        "--charter-template",
+        dest="charter_template",
+        help="Optional session charter template path",
+    )
+    cron_create.add_argument(
+        "--charter-path",
+        dest="charter_path",
+        help="Optional rendered session charter path to inject into the prompt",
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -6952,6 +6967,21 @@ For more help on a command:
     cron_edit.add_argument(
         "--script",
         help="Path to a Python script whose stdout is injected into the prompt each run. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--context-cwd",
+        dest="context_cwd",
+        help="Optional TERMINAL_CWD override for the cron session. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--charter-template",
+        dest="charter_template",
+        help="Optional session charter template path. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--charter-path",
+        dest="charter_path",
+        help="Optional rendered session charter path to inject into the prompt. Pass empty string to clear.",
     )
 
     # lifecycle actions

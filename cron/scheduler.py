@@ -590,6 +590,39 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
+def _extract_charter_path(job: dict, prerun_script: Optional[tuple] = None) -> Optional[str]:
+    """Resolve the rendered charter path for a cron run.
+
+    Priority:
+    1. Explicit job charter_path
+    2. JSON emitted by the pre-run script (`charterPath` or `charterLatestPath`)
+    """
+    explicit = str(job.get("charter_path") or "").strip()
+    if explicit:
+        return explicit
+
+    if not prerun_script:
+        return None
+
+    success, script_output = prerun_script
+    if not success or not script_output:
+        return None
+
+    try:
+        payload = json.loads(script_output)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("charterPath", "charterLatestPath"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
 def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """Build the effective prompt for a cron job, optionally loading one or more skills first.
 
@@ -603,14 +636,16 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     """
     prompt = job.get("prompt", "")
     skills = job.get("skills")
+    charter_path = _extract_charter_path(job, prerun_script=prerun_script)
 
     # Run data-collection script if configured, inject output as context.
     script_path = job.get("script")
-    if script_path:
-        if prerun_script is not None:
-            success, script_output = prerun_script
-        else:
-            success, script_output = _run_job_script(script_path)
+    script_result = prerun_script
+    if script_result is None and script_path:
+        script_result = _run_job_script(script_path)
+
+    if script_result is not None:
+        success, script_output = script_result
         if success:
             if script_output:
                 prompt = (
@@ -632,6 +667,24 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 f"```\n{script_output}\n```\n\n"
                 f"{prompt}"
             )
+
+    if charter_path:
+        try:
+            charter_text = Path(charter_path).read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            prompt = (
+                "## Session Charter Error\n"
+                "The session charter could not be loaded. Report this to the user.\n\n"
+                f"```\n{charter_path}: {exc}\n```\n\n"
+                f"{prompt}"
+            )
+        else:
+            if charter_text:
+                prompt = (
+                    "## Session Charter\n"
+                    f"{charter_text}\n\n"
+                    f"{prompt}"
+                )
 
     # Always prepend cron execution guidance so the agent knows how
     # delivery works and can suppress delivery when appropriate.
@@ -756,6 +809,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         chat_id=str(origin["chat_id"]) if origin else "",
         chat_name=origin.get("chat_name", "") if origin else "",
     )
+    context_cwd = str(job.get("context_cwd") or "").strip() or None
+    previous_terminal_cwd = os.environ.get("TERMINAL_CWD")
+    if context_cwd:
+        os.environ["TERMINAL_CWD"] = context_cwd
 
     try:
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -1015,6 +1072,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         return False, output, "", error_msg
 
     finally:
+        if context_cwd:
+            if previous_terminal_cwd is None:
+                os.environ.pop("TERMINAL_CWD", None)
+            else:
+                os.environ["TERMINAL_CWD"] = previous_terminal_cwd
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
         if _session_db:
