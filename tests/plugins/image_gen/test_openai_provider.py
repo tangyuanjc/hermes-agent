@@ -80,6 +80,23 @@ class TestAvailability:
         monkeypatch.setenv("OPENAI_API_KEY", "test")
         assert openai_plugin.OpenAIImageGenProvider().is_available() is True
 
+    def test_custom_model_config_available_without_openai_env(self, monkeypatch, tmp_path):
+        import yaml
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({
+                "model": {
+                    "provider": "custom",
+                    "base_url": "https://proxy.example.test/v1",
+                    "api_key": "sk-profile",
+                }
+            })
+        )
+
+        assert openai_plugin.OpenAIImageGenProvider().is_available() is True
+
 
 # ── Model resolution ────────────────────────────────────────────────────────
 
@@ -132,9 +149,43 @@ class TestGenerate:
 
     def test_missing_api_key(self, monkeypatch):
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
         result = openai_plugin.OpenAIImageGenProvider().generate("a cat")
         assert result["success"] is False
         assert result["error_type"] == "auth_required"
+
+    def test_uses_custom_model_config_client_credentials(self, monkeypatch, tmp_path):
+        import yaml
+
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({
+                "model": {
+                    "provider": "custom",
+                    "base_url": "https://proxy.example.test/v1",
+                    "api_key": "sk-profile",
+                },
+                "image_gen": {
+                    "provider": "openai",
+                    "openai": {"model": "gpt-image-2-low"},
+                },
+            })
+        )
+        fake_client = MagicMock()
+        fake_client.images.generate.return_value = _fake_response(b64=_b64_png())
+        fake_openai = MagicMock()
+        fake_openai.OpenAI.return_value = fake_client
+
+        with patch.dict("sys.modules", {"openai": fake_openai}):
+            result = openai_plugin.OpenAIImageGenProvider().generate("a cat")
+
+        assert result["success"] is True
+        assert result["model"] == "gpt-image-2-low"
+        fake_openai.OpenAI.assert_called_once_with(
+            api_key="sk-profile",
+            base_url="https://proxy.example.test/v1",
+        )
 
     def test_b64_saves_to_cache(self, provider, tmp_path):
         import base64
