@@ -13,12 +13,19 @@ All three hit the same underlying API model (``gpt-image-2``) with a
 different ``quality`` parameter. Output is base64 JSON → saved under
 ``$HERMES_HOME/cache/images/``.
 
-Selection precedence (first hit wins):
+Model selection precedence (first hit wins):
 
 1. ``OPENAI_IMAGE_MODEL`` env var (escape hatch for scripts / tests)
 2. ``image_gen.openai.model`` in ``config.yaml``
 3. ``image_gen.model`` in ``config.yaml`` (when it's one of our tier IDs)
 4. :data:`DEFAULT_MODEL` — ``gpt-image-2-medium``
+
+Credential selection precedence:
+
+1. ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` env vars
+2. ``image_gen.openai.api_key`` / ``image_gen.openai.base_url``
+3. ``model.api_key`` / ``model.base_url`` when the active model provider is a
+   custom OpenAI-compatible endpoint
 """
 
 from __future__ import annotations
@@ -79,17 +86,68 @@ _SIZES = {
 }
 
 
-def _load_openai_config() -> Dict[str, Any]:
-    """Read ``image_gen`` from config.yaml (returns {} on any failure)."""
+def _load_config() -> Dict[str, Any]:
+    """Read Hermes config.yaml (returns {} on any failure)."""
     try:
         from hermes_cli.config import load_config
 
         cfg = load_config()
-        section = cfg.get("image_gen") if isinstance(cfg, dict) else None
-        return section if isinstance(section, dict) else {}
+        return cfg if isinstance(cfg, dict) else {}
     except Exception as exc:
-        logger.debug("Could not load image_gen config: %s", exc)
+        logger.debug("Could not load Hermes config: %s", exc)
         return {}
+
+
+def _load_openai_config() -> Dict[str, Any]:
+    """Read ``image_gen`` from config.yaml (returns {} on any failure)."""
+    cfg = _load_config()
+    section = cfg.get("image_gen") if isinstance(cfg, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def _resolve_client_config() -> Tuple[Optional[str], Optional[str]]:
+    """Return ``(api_key, base_url)`` for the OpenAI-compatible image client."""
+    env_key = os.environ.get("OPENAI_API_KEY")
+    env_base_url = os.environ.get("OPENAI_BASE_URL")
+    if isinstance(env_key, str) and env_key.strip():
+        base_url = (
+            env_base_url.strip()
+            if isinstance(env_base_url, str) and env_base_url.strip()
+            else None
+        )
+        return env_key.strip(), base_url
+
+    cfg = _load_config()
+    image_cfg = cfg.get("image_gen") if isinstance(cfg, dict) else None
+    openai_cfg = image_cfg.get("openai") if isinstance(image_cfg, dict) else None
+    if isinstance(openai_cfg, dict):
+        config_key = openai_cfg.get("api_key")
+        config_base_url = openai_cfg.get("base_url")
+        if isinstance(config_key, str) and config_key.strip():
+            base_url = (
+                config_base_url.strip()
+                if isinstance(config_base_url, str) and config_base_url.strip()
+                else None
+            )
+            return config_key.strip(), base_url
+
+    model_cfg = cfg.get("model") if isinstance(cfg, dict) else None
+    if not isinstance(model_cfg, dict):
+        return None, None
+
+    provider = str(model_cfg.get("provider") or "").strip().lower()
+    model_key = model_cfg.get("api_key")
+    model_base_url = model_cfg.get("base_url")
+    if (
+        provider == "custom"
+        and isinstance(model_key, str)
+        and model_key.strip()
+        and isinstance(model_base_url, str)
+        and model_base_url.strip()
+    ):
+        return model_key.strip(), model_base_url.strip()
+
+    return None, None
 
 
 def _resolve_model() -> Tuple[str, Dict[str, Any]]:
@@ -133,7 +191,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
         return "OpenAI"
 
     def is_available(self) -> bool:
-        if not os.environ.get("OPENAI_API_KEY"):
+        api_key, _ = _resolve_client_config()
+        if not api_key:
             return False
         try:
             import openai  # noqa: F401
@@ -187,12 +246,13 @@ class OpenAIImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        if not os.environ.get("OPENAI_API_KEY"):
+        api_key, base_url = _resolve_client_config()
+        if not api_key:
             return error_response(
                 error=(
-                    "OPENAI_API_KEY not set. Run `hermes tools` → Image "
-                    "Generation → OpenAI to configure, or `hermes setup` "
-                    "to add the key."
+                    "OpenAI image credentials not set. Configure "
+                    "OPENAI_API_KEY, image_gen.openai.api_key, or a custom "
+                    "OpenAI-compatible model.api_key/base_url in config.yaml."
                 ),
                 error_type="auth_required",
                 provider="openai",
@@ -223,7 +283,10 @@ class OpenAIImageGenProvider(ImageGenProvider):
         }
 
         try:
-            client = openai.OpenAI()
+            client_kwargs: Dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                client_kwargs["base_url"] = base_url
+            client = openai.OpenAI(**client_kwargs)
             response = client.images.generate(**payload)
         except Exception as exc:
             logger.debug("OpenAI image generation failed", exc_info=True)
