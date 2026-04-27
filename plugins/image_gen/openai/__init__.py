@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.image_gen_provider import (
@@ -271,6 +272,28 @@ class OpenAIImageGenProvider(ImageGenProvider):
 
         tier_id, meta = _resolve_model()
         size = _SIZES.get(aspect, _SIZES["square"])
+        reference_image = kwargs.get("reference_image")
+        reference_path: Optional[Path] = None
+        if isinstance(reference_image, str) and reference_image.strip():
+            reference_path = Path(reference_image.strip()).expanduser()
+            if not reference_path.exists():
+                return error_response(
+                    error=f"Reference image not found: {reference_path}",
+                    error_type="invalid_reference_image",
+                    provider="openai",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
+            if not reference_path.is_file():
+                return error_response(
+                    error=f"Reference image is not a file: {reference_path}",
+                    error_type="invalid_reference_image",
+                    provider="openai",
+                    model=tier_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
 
         # gpt-image-2 returns b64_json unconditionally and REJECTS
         # ``response_format`` as an unknown parameter. Don't send it.
@@ -287,7 +310,11 @@ class OpenAIImageGenProvider(ImageGenProvider):
             if base_url:
                 client_kwargs["base_url"] = base_url
             client = openai.OpenAI(**client_kwargs)
-            response = client.images.generate(**payload)
+            if reference_path is not None:
+                with reference_path.open("rb") as image_file:
+                    response = client.images.edit(image=image_file, **payload)
+            else:
+                response = client.images.generate(**payload)
         except Exception as exc:
             logger.debug("OpenAI image generation failed", exc_info=True)
             return error_response(
@@ -343,6 +370,8 @@ class OpenAIImageGenProvider(ImageGenProvider):
             )
 
         extra: Dict[str, Any] = {"size": size, "quality": meta["quality"]}
+        if reference_path is not None:
+            extra["reference_image"] = str(reference_path)
         if revised_prompt:
             extra["revised_prompt"] = revised_prompt
 
