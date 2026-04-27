@@ -139,7 +139,8 @@ class ImageGenProvider(abc.ABC):
         Implementations should return the dict from :func:`success_response`
         or :func:`error_response`. ``kwargs`` may contain forward-compat
         parameters future versions of the schema will expose — implementations
-        should ignore unknown keys.
+        should ignore unknown keys. ``reference_image`` may contain a local
+        image path for providers that support image-to-image generation.
         """
 
 

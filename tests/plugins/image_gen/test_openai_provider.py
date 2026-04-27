@@ -215,6 +215,41 @@ class TestGenerate:
         # gpt-image-2 rejects response_format — we must NOT send it.
         assert "response_format" not in call_kwargs
 
+    def test_reference_image_uses_edit_endpoint(self, provider, tmp_path):
+        reference = tmp_path / "reference.png"
+        reference.write_bytes(bytes.fromhex(_PNG_HEX))
+        fake_client = MagicMock()
+        fake_client.images.edit.return_value = _fake_response(b64=_b64_png())
+
+        with _patched_openai(fake_client):
+            result = provider.generate(
+                "turn this into an ad",
+                aspect_ratio="landscape",
+                reference_image=str(reference),
+            )
+
+        assert result["success"] is True
+        assert result["reference_image"] == str(reference)
+        fake_client.images.edit.assert_called_once()
+        fake_client.images.generate.assert_not_called()
+        call_kwargs = fake_client.images.edit.call_args.kwargs
+        assert call_kwargs["model"] == "gpt-image-2"
+        assert call_kwargs["prompt"] == "turn this into an ad"
+        assert call_kwargs["size"] == "1536x1024"
+        assert call_kwargs["quality"] == "medium"
+        image_arg = call_kwargs["image"]
+        assert hasattr(image_arg, "read")
+        assert image_arg.closed
+
+    def test_missing_reference_image_rejected(self, provider, tmp_path):
+        result = provider.generate(
+            "turn this into an ad",
+            reference_image=str(tmp_path / "missing.png"),
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "invalid_reference_image"
+
     @pytest.mark.parametrize("tier,expected_quality", [
         ("gpt-image-2-low", "low"),
         ("gpt-image-2-medium", "medium"),
