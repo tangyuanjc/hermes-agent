@@ -248,6 +248,7 @@ def fetch_likes(cj, ids, username=None, user_id=None, limit=20):
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / 'config' / 'x_users.toml'
 CHANNELS = ('bookmarks', 'for_you', 'following', 'likes')
+FETCH_DEPTH_LIMIT = 50
 
 
 def parse_user_config(text):
@@ -309,10 +310,10 @@ def add_channel(out, counts, channel, username, tweets):
 
 
 def fetch_owner_channels(cj, ids, username, twid):
-    bookmarks, e_b = fetch_bookmarks(cj, ids, 20)
-    foryou, e_f = fetch_timeline(cj, ids, 'for-you', 20)
-    following, e_fl = fetch_timeline(cj, ids, 'following', 20)
-    likes, e_l = fetch_likes(cj, ids, username=username, user_id=twid, limit=15)
+    bookmarks, e_b = fetch_bookmarks(cj, ids, FETCH_DEPTH_LIMIT)
+    foryou, e_f = fetch_timeline(cj, ids, 'for-you', FETCH_DEPTH_LIMIT)
+    following, e_fl = fetch_timeline(cj, ids, 'following', FETCH_DEPTH_LIMIT)
+    likes, e_l = fetch_likes(cj, ids, username=username, user_id=twid, limit=FETCH_DEPTH_LIMIT)
     return {
         'bookmarks': (bookmarks, e_b),
         'for_you': (foryou, e_f),
@@ -322,7 +323,7 @@ def fetch_owner_channels(cj, ids, username, twid):
 
 
 def fetch_kol_channels(cj, ids, username):
-    tweets, tweets_err = fetch_user_tweets(cj, ids, username=username, limit=8)
+    tweets, tweets_err = fetch_user_tweets(cj, ids, username=username, limit=FETCH_DEPTH_LIMIT)
     likes, likes_err = [], {'_skipped': 'kol likes disabled for cron budget'}
     return {
         'bookmarks': ([], {'_skipped': 'auth account only'}),
