@@ -213,6 +213,8 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+_FEISHU_ADJACENT_MEDIA_TTL_SECONDS = 5 * 60        # allow "image first, @bot next" group workflows
+_FEISHU_ADJACENT_MEDIA_MAX_MESSAGES = 8
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once",
@@ -1450,6 +1452,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
+        self._message_context_cache: Dict[str, tuple[Optional[str], List[str], List[str]]] = {}
+        self._recent_group_media: Dict[tuple[str, str], List[tuple[float, Any]]] = {}
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
         self._pending_text_batches = self._text_batch_state.events
@@ -2413,10 +2417,15 @@ class FeishuAdapter(BasePlatformAdapter):
 
         reason = self._admit(sender, message)
         if reason is not None:
+            if reason == "group_policy_rejected" and self._stash_group_media_for_later(sender, message):
+                return
             logger.debug("[Feishu] dropping inbound event: %s", reason)
             return
 
         chat_type = getattr(message, "chat_type", "p2p")
+        adjacent_media = self._pop_recent_group_media(sender, message)
+        if adjacent_media:
+            setattr(message, "_adjacent_media_messages", adjacent_media)
         await self._process_inbound_message(
             data=data,
             message=message,
@@ -2971,6 +2980,15 @@ class FeishuAdapter(BasePlatformAdapter):
         is_bot: bool = False,
     ) -> None:
         text, inbound_type, media_urls, media_types, mentions = await self._extract_message_content(message)
+        adjacent_media_urls: List[str] = []
+        adjacent_media_types: List[str] = []
+        for adjacent_message in getattr(message, "_adjacent_media_messages", []) or []:
+            _, _, urls, types, _ = await self._extract_message_content(adjacent_message)
+            adjacent_media_urls.extend(urls)
+            adjacent_media_types.extend(types)
+        if adjacent_media_urls:
+            media_urls = adjacent_media_urls + media_urls
+            media_types = adjacent_media_types + media_types
 
         if inbound_type == MessageType.TEXT:
             text = _strip_edge_self_mentions(text, mentions)
@@ -2994,7 +3012,15 @@ class FeishuAdapter(BasePlatformAdapter):
             or getattr(message, "root_id", None)
             or None
         )
-        reply_to_text = await self._fetch_message_text(reply_to_message_id) if reply_to_message_id else None
+        reply_media_urls: List[str] = []
+        reply_media_types: List[str] = []
+        if reply_to_message_id:
+            reply_to_text, reply_media_urls, reply_media_types = await self._fetch_message_context(reply_to_message_id)
+            if reply_media_urls:
+                media_urls = reply_media_urls + media_urls
+                media_types = reply_media_types + media_types
+        else:
+            reply_to_text = None
 
         sender_primary = (
             getattr(sender_id, "open_id", None)
@@ -3884,10 +3910,18 @@ class FeishuAdapter(BasePlatformAdapter):
             return None
 
     async def _fetch_message_text(self, message_id: str) -> Optional[str]:
+        text, _, _ = await self._fetch_message_context(message_id)
+        return text
+
+    async def _fetch_message_context(self, message_id: str) -> tuple[Optional[str], List[str], List[str]]:
         if not self._client or not message_id:
-            return None
-        if message_id in self._message_text_cache:
-            return self._message_text_cache[message_id]
+            return None, [], []
+        if not hasattr(self, "_message_context_cache"):
+            self._message_context_cache = {}
+        if not hasattr(self, "_message_text_cache"):
+            self._message_text_cache = {}
+        if message_id in self._message_context_cache:
+            return self._message_context_cache[message_id]
         try:
             request = self._build_get_message_request(message_id)
             response = await asyncio.to_thread(self._client.im.v1.message.get, request)
@@ -3895,23 +3929,38 @@ class FeishuAdapter(BasePlatformAdapter):
                 code = getattr(response, "code", "unknown")
                 msg = getattr(response, "msg", "message lookup failed")
                 logger.warning("[Feishu] Failed to fetch parent message %s: [%s] %s", message_id, code, msg)
-                return None
+                return None, [], []
             items = getattr(getattr(response, "data", None), "items", None) or []
             parent = items[0] if items else None
             body = getattr(parent, "body", None)
-            msg_type = getattr(parent, "msg_type", "") or ""
-            raw_content = getattr(body, "content", "") or ""
+            msg_type = getattr(parent, "msg_type", None) or getattr(parent, "message_type", "") or ""
+            raw_content = getattr(body, "content", None) or getattr(parent, "content", "") or ""
             parent_mentions = getattr(parent, "mentions", None) if parent else None
-            text = self._extract_text_from_raw_content(
-                msg_type=msg_type,
+            parent_message_id = str(getattr(parent, "message_id", "") or message_id)
+            normalized = normalize_feishu_message(
+                message_type=msg_type,
                 raw_content=raw_content,
                 mentions=parent_mentions,
+                bot=self._bot_identity(),
             )
+            media_urls, media_types = await self._download_feishu_message_resources(
+                message_id=parent_message_id,
+                normalized=normalized,
+            )
+            text = normalized.text_content
+            if not text:
+                placeholder = normalized.metadata.get("placeholder_text") if isinstance(normalized.metadata, dict) else None
+                text = str(placeholder).strip() if placeholder is not None else None
+                text = text or None
+            context = (text, media_urls, media_types)
+            self._message_context_cache[message_id] = context
             self._message_text_cache[message_id] = text
-            return text
+            if media_urls:
+                logger.info("[Feishu] Fetched parent message %s with %d media resource(s)", message_id, len(media_urls))
+            return context
         except Exception:
             logger.warning("[Feishu] Failed to fetch parent message %s", message_id, exc_info=True)
-            return None
+            return None, [], []
 
     def _extract_text_from_raw_content(
         self,
@@ -3948,6 +3997,84 @@ class FeishuAdapter(BasePlatformAdapter):
     # =========================================================================
     # Inbound admission
     # =========================================================================
+
+    def _recent_group_media_key(self, sender: Any, message: Any) -> Optional[tuple[str, str]]:
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        sender_id = getattr(sender, "sender_id", None)
+        participant_id = (
+            getattr(sender_id, "open_id", None)
+            or getattr(sender_id, "user_id", None)
+            or getattr(sender_id, "union_id", None)
+        )
+        if not chat_id or not participant_id:
+            return None
+        return chat_id, str(participant_id)
+
+    @staticmethod
+    def _is_media_message(message: Any) -> bool:
+        normalized = normalize_feishu_message(
+            message_type=getattr(message, "message_type", "") or "",
+            raw_content=getattr(message, "content", "") or "",
+            mentions=getattr(message, "mentions", None),
+        )
+        return bool(normalized.image_keys or normalized.media_refs)
+
+    def _prune_recent_group_media(self, now: Optional[float] = None) -> None:
+        if not hasattr(self, "_recent_group_media"):
+            self._recent_group_media = {}
+        cutoff = (now if now is not None else time.time()) - _FEISHU_ADJACENT_MEDIA_TTL_SECONDS
+        for key in list(self._recent_group_media):
+            retained = [(ts, msg) for ts, msg in self._recent_group_media[key] if ts >= cutoff]
+            if retained:
+                self._recent_group_media[key] = retained[-_FEISHU_ADJACENT_MEDIA_MAX_MESSAGES:]
+            else:
+                self._recent_group_media.pop(key, None)
+
+    def _stash_group_media_for_later(self, sender: Any, message: Any) -> bool:
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        if getattr(message, "chat_type", "p2p") == "p2p" or not chat_id:
+            return False
+        if not self._require_mention_for(chat_id) or self._mentions_self(message):
+            return False
+        if not self._allow_group_message(
+            getattr(sender, "sender_id", None),
+            chat_id,
+            is_bot=_is_bot_sender(sender),
+        ):
+            return False
+        if _is_bot_sender(sender) or not self._is_media_message(message):
+            return False
+        key = self._recent_group_media_key(sender, message)
+        if key is None:
+            return False
+        now = time.time()
+        self._prune_recent_group_media(now)
+        bucket = self._recent_group_media.setdefault(key, [])
+        bucket.append((now, message))
+        del bucket[:-_FEISHU_ADJACENT_MEDIA_MAX_MESSAGES]
+        logger.info(
+            "[Feishu] Holding group media message %s for next mention in chat=%s",
+            getattr(message, "message_id", "") or "",
+            key[0],
+        )
+        return True
+
+    def _pop_recent_group_media(self, sender: Any, message: Any) -> List[Any]:
+        if getattr(message, "chat_type", "p2p") == "p2p":
+            return []
+        key = self._recent_group_media_key(sender, message)
+        if key is None:
+            return []
+        self._prune_recent_group_media()
+        bucket = self._recent_group_media.pop(key, [])
+        if bucket:
+            logger.info(
+                "[Feishu] Attaching %d held media message(s) to mention %s in chat=%s",
+                len(bucket),
+                getattr(message, "message_id", "") or "",
+                key[0],
+            )
+        return [msg for _, msg in bucket]
 
     def _admit(self, sender: Any, message: Any) -> Optional[RejectReason]:
         sender_ids = _sender_identity(sender)
