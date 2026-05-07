@@ -803,12 +803,27 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
     auth_file = _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
+    # Tighten parent dir to 0o700 so siblings can't traverse to creds.
+    # No-op on Windows (POSIX mode bits not enforced); ignore failures.
+    try:
+        os.chmod(auth_file.parent, 0o700)
+    except OSError:
+        pass
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
+        # Create with 0o600 atomically via os.open(O_EXCL) + fdopen to close
+        # the TOCTOU window where default umask (often 0o644) briefly exposed
+        # OAuth tokens to other local users between open() and chmod().
+        # Mirrors agent/google_oauth.py (#19673) and tools/mcp_oauth.py (#21148).
+        fd = os.open(
+            str(tmp_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -1303,10 +1318,33 @@ def _read_qwen_cli_tokens() -> Dict[str, Any]:
 def _save_qwen_cli_tokens(tokens: Dict[str, Any]) -> Path:
     auth_path = _qwen_cli_auth_path()
     auth_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = auth_path.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(tokens, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
-    tmp_path.replace(auth_path)
+    try:
+        os.chmod(auth_path.parent, 0o700)
+    except OSError:
+        pass
+    # Per-process random temp suffix avoids collisions between concurrent
+    # writers and stale leftovers from a crashed prior write.
+    tmp_path = auth_path.with_name(f"{auth_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    # Create with 0o600 atomically via os.open(O_EXCL) — closes the TOCTOU
+    # window where write_text() + post-write chmod briefly exposed tokens
+    # at process umask (typically 0o644). See #19673, #21148.
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(tokens, indent=2, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        atomic_replace(tmp_path, auth_path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
     return auth_path
 
 
@@ -2531,6 +2569,293 @@ def _poll_for_token(
 # =============================================================================
 # Nous Portal — token refresh, agent key minting, model discovery
 # =============================================================================
+
+# -----------------------------------------------------------------------------
+# Shared Nous token store — lets OAuth credentials persist across profiles
+# so a new `hermes --profile <name> auth add nous --type oauth` can one-tap
+# import instead of running the full device-code flow every time.
+#
+# File lives at ${HERMES_SHARED_AUTH_DIR}/nous_auth.json, defaulting to
+# ~/.hermes/shared/nous_auth.json. It is OUTSIDE any named profile's
+# HERMES_HOME so named profiles (which typically live under
+# ~/.hermes/profiles/<name>/) all see the same file.
+#
+# Written on successful login and on every runtime refresh so the stored
+# refresh_token stays current even if one profile refreshes and rotates it.
+# If ever the stored refresh_token does go stale server-side, import fails
+# gracefully and the user falls back to the normal device-code flow.
+# -----------------------------------------------------------------------------
+
+NOUS_SHARED_STORE_FILENAME = "nous_auth.json"
+_nous_shared_lock_holder = threading.local()
+
+
+def _nous_shared_auth_dir() -> Path:
+    """Resolve the directory that holds the shared Nous token store.
+
+    Honors ``HERMES_SHARED_AUTH_DIR`` so tests can redirect it to a tmp
+    path without touching the real user's home. Defaults to
+    ``~/.hermes/shared/``.
+    """
+    override = os.getenv("HERMES_SHARED_AUTH_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".hermes" / "shared"
+
+
+def _nous_shared_store_path() -> Path:
+    path = _nous_shared_auth_dir() / NOUS_SHARED_STORE_FILENAME
+    # Seat belt: if pytest is running and this resolves to a path under the
+    # real user's home, refuse rather than silently corrupt cross-profile
+    # state. Tests must set HERMES_SHARED_AUTH_DIR to a tmp_path (conftest
+    # does not do this automatically — mirror the _auth_file_path() guard
+    # so forgetting to set it fails loudly instead of writing to the real
+    # shared store).
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_shared = (
+            Path.home() / ".hermes" / "shared" / NOUS_SHARED_STORE_FILENAME
+        ).resolve(strict=False)
+        try:
+            resolved = path.resolve(strict=False)
+        except Exception:
+            resolved = path
+        if resolved == real_home_shared:
+            raise RuntimeError(
+                f"Refusing to touch real user shared Nous auth store during test run: "
+                f"{path}. Set HERMES_SHARED_AUTH_DIR to a tmp_path in your test fixture."
+            )
+    return path
+
+
+@contextmanager
+def _nous_shared_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+    """Cross-profile lock for the shared Nous OAuth store.
+
+    Lock ordering invariant: if both this and ``_auth_store_lock`` need
+    to be held, acquire ``_auth_store_lock`` FIRST. All runtime refresh
+    paths follow this order. The one exception is
+    ``_try_import_shared_nous_state``, which holds this lock alone for
+    the entire refresh+mint cycle so concurrent imports on sibling
+    profiles can't race on the single-use shared refresh token; that
+    helper must NOT be called with ``_auth_store_lock`` already held.
+    """
+    try:
+        lock_path = _nous_shared_store_path().with_suffix(".lock")
+    except RuntimeError:
+        # No HERMES_HOME yet (pre-setup): fall through without locking.
+        yield
+        return
+
+    with _file_lock(
+        lock_path,
+        _nous_shared_lock_holder,
+        timeout_seconds,
+        "Timed out waiting for shared Nous auth lock",
+    ):
+        yield
+
+
+def _merge_shared_nous_oauth_state(state: Dict[str, Any]) -> bool:
+    """Copy fresher shared OAuth tokens into a profile-local Nous state."""
+    shared = _read_shared_nous_state()
+    if not shared:
+        return False
+
+    shared_refresh = shared.get("refresh_token")
+    if not isinstance(shared_refresh, str) or not shared_refresh.strip():
+        return False
+
+    local_refresh = state.get("refresh_token")
+    shared_access_exp = _parse_iso_timestamp(shared.get("expires_at")) or 0.0
+    local_access_exp = _parse_iso_timestamp(state.get("expires_at")) or 0.0
+    refresh_changed = shared_refresh.strip() != str(local_refresh or "").strip()
+    fresher_access = shared_access_exp > local_access_exp
+    if not refresh_changed and not fresher_access:
+        return False
+
+    for key in (
+        "access_token",
+        "refresh_token",
+        "token_type",
+        "scope",
+        "client_id",
+        "portal_base_url",
+        "inference_base_url",
+        "obtained_at",
+        "expires_at",
+    ):
+        value = shared.get(key)
+        if value not in (None, ""):
+            state[key] = value
+    return True
+
+
+def _write_shared_nous_state(state: Dict[str, Any]) -> None:
+    """Persist a minimal copy of the Nous OAuth state to the shared store.
+
+    Best-effort: any failure is swallowed after logging. The shared store
+    is a convenience layer; the per-profile auth.json remains the source
+    of truth.
+
+    We deliberately omit the short-lived ``agent_key`` (24h TTL, profile-
+    specific) — only the long-lived OAuth tokens are cross-profile useful.
+    """
+    refresh_token = state.get("refresh_token")
+    access_token = state.get("access_token")
+    if not (isinstance(refresh_token, str) and refresh_token.strip()):
+        # No refresh_token = nothing worth sharing across profiles
+        return
+    if not (isinstance(access_token, str) and access_token.strip()):
+        return
+
+    shared = {
+        "_schema": 1,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": state.get("token_type") or "Bearer",
+        "scope": state.get("scope") or DEFAULT_NOUS_SCOPE,
+        "client_id": state.get("client_id") or DEFAULT_NOUS_CLIENT_ID,
+        "portal_base_url": state.get("portal_base_url") or DEFAULT_NOUS_PORTAL_URL,
+        "inference_base_url": state.get("inference_base_url") or DEFAULT_NOUS_INFERENCE_URL,
+        "obtained_at": state.get("obtained_at"),
+        "expires_at": state.get("expires_at"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        with _nous_shared_store_lock():
+            path = _nous_shared_store_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass
+            tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+            # Create with 0o600 atomically via os.open(O_EXCL) — closes the TOCTOU
+            # window where write_text() + post-write chmod briefly exposed Nous
+            # refresh_token at process umask. See #19673, #21148.
+            fd = os.open(
+                str(tmp),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(shared, indent=2, sort_keys=True))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.replace(tmp, path)
+            finally:
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError:
+                    pass
+        _oauth_trace(
+            "nous_shared_store_written",
+            path=str(path),
+            refresh_token_fp=_token_fingerprint(refresh_token),
+        )
+    except Exception as exc:
+        logger.debug("Failed to write shared Nous auth store: %s", exc)
+
+
+def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
+    """Return the shared Nous OAuth state if present and well-formed.
+
+    Returns ``None`` when the file is missing, unreadable, malformed, or
+    lacks required fields. Callers should treat ``None`` as "no shared
+    credentials available — fall through to device-code".
+    """
+    try:
+        path = _nous_shared_store_path()
+    except RuntimeError:
+        # Test seat belt tripped — treat as missing
+        return None
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        logger.debug("Shared Nous auth store at %s is unreadable: %s", path, exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    refresh_token = payload.get("refresh_token")
+    access_token = payload.get("access_token")
+    if not (isinstance(refresh_token, str) and refresh_token.strip()):
+        return None
+    if not (isinstance(access_token, str) and access_token.strip()):
+        return None
+    return payload
+
+
+def _try_import_shared_nous_state(
+    *,
+    timeout_seconds: float = 15.0,
+    min_key_ttl_seconds: int = 5 * 60,
+) -> Optional[Dict[str, Any]]:
+    """Attempt to rehydrate Nous OAuth state from the shared store.
+
+    Reads the shared file (if present), runs a forced refresh+mint using
+    the stored refresh_token to produce a fresh access_token + agent_key
+    scoped to this profile, and returns the full auth_state dict ready
+    for ``persist_nous_credentials()``.
+
+    Returns ``None`` when no shared state is available or the rehydrate
+    fails for any reason (expired refresh_token, portal unreachable,
+    etc.) — caller should then fall through to the normal device-code
+    flow.
+    """
+    try:
+        with _nous_shared_store_lock(timeout_seconds=max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)):
+            shared = _read_shared_nous_state()
+            if not shared:
+                return None
+
+            # Build a full state dict so refresh_nous_oauth_from_state has every
+            # field it needs. force_refresh=True gets us a fresh access_token
+            # for this profile; force_mint=True gets us a fresh agent_key.
+            state: Dict[str, Any] = {
+                "access_token": shared.get("access_token"),
+                "refresh_token": shared.get("refresh_token"),
+                "client_id": shared.get("client_id") or DEFAULT_NOUS_CLIENT_ID,
+                "portal_base_url": shared.get("portal_base_url") or DEFAULT_NOUS_PORTAL_URL,
+                "inference_base_url": shared.get("inference_base_url") or DEFAULT_NOUS_INFERENCE_URL,
+                "token_type": shared.get("token_type") or "Bearer",
+                "scope": shared.get("scope") or DEFAULT_NOUS_SCOPE,
+                "obtained_at": shared.get("obtained_at"),
+                "expires_at": shared.get("expires_at"),
+                "agent_key": None,
+                "agent_key_expires_at": None,
+                "tls": {"insecure": False, "ca_bundle": None},
+            }
+
+            refreshed = refresh_nous_oauth_from_state(
+                state,
+                min_key_ttl_seconds=min_key_ttl_seconds,
+                timeout_seconds=timeout_seconds,
+                force_refresh=True,
+                force_mint=True,
+            )
+            _write_shared_nous_state(refreshed)
+    except AuthError as exc:
+        _oauth_trace(
+            "nous_shared_import_failed",
+            error_type=type(exc).__name__,
+            error_code=getattr(exc, "code", None),
+        )
+        logger.debug("Shared Nous import failed: %s", exc)
+        return None
+    except Exception as exc:
+        _oauth_trace(
+            "nous_shared_import_failed",
+            error_type=type(exc).__name__,
+        )
+        logger.debug("Shared Nous import failed: %s", exc)
+        return None
+
+    return refreshed
+
 
 def _refresh_access_token(
     *,
