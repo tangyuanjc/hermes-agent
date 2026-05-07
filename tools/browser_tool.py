@@ -74,9 +74,13 @@ except Exception:
     check_website_access = lambda url: None  # noqa: E731 — fail-open if policy module unavailable
 
 try:
-    from tools.url_safety import is_safe_url as _is_safe_url
+    from tools.url_safety import (
+        is_safe_url as _is_safe_url,
+        is_always_blocked_url as _is_always_blocked_url,
+    )
 except Exception:
     _is_safe_url = lambda url: False  # noqa: E731 — fail-closed: block all if safety module unavailable
+    _is_always_blocked_url = lambda url: True  # noqa: E731 — fail-closed on the floor too
 from tools.browser_providers.base import CloudBrowserProvider
 from tools.browser_providers.browserbase import BrowserbaseProvider
 from tools.browser_providers.browser_use import BrowserUseProvider
@@ -1523,6 +1527,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # provider) because the agent already has full local network access via
     # the terminal tool.  Can also be opted out for cloud mode via
     # ``browser.allow_private_urls`` in config.
+    if not _is_local_backend() and _is_always_blocked_url(url):
+        return json.dumps({
+            "success": False,
+            "error": "Blocked: URL targets a cloud metadata endpoint",
+        })
+
     if not _is_local_backend() and not _allow_private_urls() and not _is_safe_url(url):
         return json.dumps({
             "success": False,
@@ -1566,6 +1576,13 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # private/internal address, block the result so the model can't read
         # internal content via subsequent browser_snapshot calls.
         # Skipped for local backends (same rationale as the pre-nav check).
+        if not _is_local_backend() and final_url and final_url != url and _is_always_blocked_url(final_url):
+            _run_browser_command(effective_task_id, "open", ["about:blank"], timeout=10)
+            return json.dumps({
+                "success": False,
+                "error": "Blocked: redirect landed on a cloud metadata endpoint",
+            })
+
         if not _is_local_backend() and not _allow_private_urls() and final_url and final_url != url and not _is_safe_url(final_url):
             # Navigate away to a blank page to prevent snapshot leaks
             _run_browser_command(effective_task_id, "open", ["about:blank"], timeout=10)

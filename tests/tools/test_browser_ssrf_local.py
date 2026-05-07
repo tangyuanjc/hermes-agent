@@ -106,6 +106,32 @@ class TestPreNavigationSsrf:
 
         assert result["success"] is True
 
+    # -- Always-blocked floor: cloud metadata regression (#16234) -------------
+
+    # The metadata floor must fire independently of the broader SSRF check.
+    # Force _is_safe_url() to pass below so this test pins the new guard.
+    IMDS_URLS = [
+        "http://169.254.169.254/latest/meta-data/",      # AWS / GCP / Azure / DO / Oracle
+        "http://169.254.169.253/metadata/instance",        # Azure IMDS wire server
+        "http://169.254.170.2/v2/credentials",             # AWS ECS task metadata
+        "http://100.100.100.200/latest/meta-data/",        # Alibaba Cloud
+        "http://metadata.google.internal/computeMetadata/v1/",  # GCP hostname
+    ]
+
+    @pytest.mark.parametrize("imds_url", IMDS_URLS)
+    def test_cloud_blocks_imds_even_when_safety_check_would_pass(
+        self, monkeypatch, _common_patches, imds_url
+    ):
+        """Cloud metadata endpoints are blocked by the non-negotiable floor."""
+        monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
+
+        result = json.loads(browser_tool.browser_navigate(imds_url))
+
+        assert result["success"] is False
+        assert "cloud metadata endpoint" in result["error"]
+
 
 # ---------------------------------------------------------------------------
 # _is_local_backend() unit tests
@@ -235,3 +261,23 @@ class TestPostRedirectSsrf:
 
         assert result["success"] is True
         assert result["url"] == final
+    # -- Always-blocked floor: redirect to IMDS (#16234) -----------------------
+
+    def test_cloud_blocks_redirect_to_imds(
+        self, monkeypatch, _common_patches
+    ):
+        """Redirect to a cloud metadata endpoint is blocked independently."""
+        imds_final = "http://169.254.169.254/latest/meta-data/"
+        monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
+        monkeypatch.setattr(
+            browser_tool,
+            "_run_browser_command",
+            lambda *a, **kw: _make_browser_result(url=imds_final),
+        )
+
+        result = json.loads(browser_tool.browser_navigate(self.PUBLIC_URL))
+
+        assert result["success"] is False
+        assert "cloud metadata endpoint" in result["error"]
