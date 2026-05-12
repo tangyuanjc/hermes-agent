@@ -43,6 +43,7 @@ import yaml
 
 from hermes_cli.config import get_hermes_home, get_config_path, read_raw_config
 from hermes_constants import OPENROUTER_BASE_URL
+from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
@@ -701,6 +702,66 @@ def _auth_lock_path() -> Path:
 
 
 _auth_lock_holder = threading.local()
+
+
+@contextmanager
+def _file_lock(
+    lock_path: Path,
+    holder: threading.local,
+    timeout_seconds: float,
+    timeout_message: str,
+):
+    """Cross-process advisory flock helper with per-lock reentrancy."""
+    if getattr(holder, "depth", 0) > 0:
+        holder.depth += 1
+        try:
+            yield
+        finally:
+            holder.depth -= 1
+        return
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fcntl is None and msvcrt is None:
+        holder.depth = 1
+        try:
+            yield
+        finally:
+            holder.depth = 0
+        return
+
+    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+        lock_path.write_text(" ", encoding="utf-8")
+
+    with lock_path.open("r+" if msvcrt else "a+") as lock_file:
+        deadline = time.monotonic() + max(1.0, timeout_seconds)
+        while True:
+            try:
+                if fcntl:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except (BlockingIOError, OSError, PermissionError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(timeout_message)
+                time.sleep(0.05)
+
+        holder.depth = 1
+        try:
+            yield
+        finally:
+            holder.depth = 0
+            if fcntl:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif msvcrt:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except (OSError, IOError):
+                    pass
+
 
 @contextmanager
 def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
