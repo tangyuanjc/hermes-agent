@@ -29,7 +29,39 @@ import uuid
 from typing import Any, Dict, Optional, Union
 from urllib.parse import urlencode
 
-import fal_client
+# fal_client is imported lazily — see _load_fal_client(). Pulling it
+# eagerly added ~64 ms to every CLI cold start because
+# discover_builtin_tools() imports this module unconditionally during
+# the registry walk, even when image generation is never used.
+#
+# Tests that monkeypatch this attribute (e.g.
+# ``monkeypatch.setattr(image_tool, "fal_client", fake_fal_client)``)
+# still work: _load_fal_client() short-circuits when the attribute is
+# anything truthy, so a test-installed mock is not overwritten by a
+# subsequent real import.
+fal_client: Any = None
+
+
+def _load_fal_client() -> Any:
+    """Lazily import fal_client and rebind the module global on first use.
+
+    Idempotent. Returns the (now-loaded) ``fal_client`` module reference.
+    Skips the import if the global is already truthy — this preserves the
+    test pattern of monkeypatching the module global to install a mock.
+    """
+    global fal_client
+    if fal_client is not None:
+        return fal_client
+    try:
+        from tools.lazy_deps import ensure as _lazy_ensure
+        _lazy_ensure("image.fal", prompt=False)
+    except ImportError:
+        pass
+    except Exception as e:
+        raise ImportError(str(e))
+    import fal_client as _fal_client  # noqa: F811 — module-global rebind
+    fal_client = _fal_client
+    return fal_client
 
 from tools.debug_helpers import DebugSession
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
@@ -338,6 +370,7 @@ class _ManagedFalSyncClient:
     """Small per-instance wrapper around fal_client.SyncClient for managed queue hosts."""
 
     def __init__(self, *, key: str, queue_run_origin: str):
+        _load_fal_client()
         sync_client_class = getattr(fal_client, "SyncClient", None)
         if sync_client_class is None:
             raise RuntimeError("fal_client.SyncClient is required for managed FAL gateway mode")
@@ -435,6 +468,7 @@ def _get_managed_fal_client(managed_gateway):
 
 def _submit_fal_request(model: str, arguments: Dict[str, Any]):
     """Submit a FAL request using direct credentials or the managed queue gateway."""
+    _load_fal_client()
     request_headers = {"x-idempotency-key": str(uuid.uuid4())}
     managed_gateway = _resolve_managed_fal_gateway()
     if managed_gateway is None:
@@ -790,7 +824,7 @@ def check_image_generation_requirements() -> bool:
     """
     try:
         if check_fal_api_key():
-            fal_client  # noqa: F401 — SDK presence check
+            _load_fal_client()
             return True
     except ImportError:
         pass

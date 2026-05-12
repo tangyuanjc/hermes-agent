@@ -12,7 +12,7 @@ authors = [{ name = "Nous Research" }]
 license = { text = "MIT" }
 dependencies = [
   # Core — pinned to known-good ranges to limit supply chain attack surface
-  "openai>=2.21.0,<3",
+  "openai>=2.30.0,<3",
   "anthropic>=0.39.0,<1",
   "python-dotenv>=1.2.1,<2",
   "fire>=0.7.1,<1",
@@ -62,7 +62,10 @@ mcp = ["mcp>=1.2.0,<2"]
 homeassistant = ["aiohttp>=3.9.0,<4"]
 sms = ["aiohttp>=3.9.0,<4"]
 acp = ["agent-client-protocol>=0.9.0,<1.0"]
-mistral = ["mistralai>=2.3.0,<3"]
+# mistral extra removed 2026-05-12 while the `mistralai` PyPI project is
+# quarantined after the malicious 2.4.6 release. Restore only after verifying
+# a clean release, then re-enable Mistral in lazy_deps/tools_config/web_server
+# and the STT/TTS provider stubs.
 bedrock = ["boto3>=1.35.0,<2"]
 termux = [
   # Tested Android / Termux path: keeps the core CLI feature-rich while

@@ -71,7 +71,7 @@ function Write-Err {
 
 function Install-Uv {
     Write-Info "Checking for uv package manager..."
-    
+
     # Check if uv is already available
     if (Get-Command uv -ErrorAction SilentlyContinue) {
         $version = uv --version
@@ -549,27 +549,137 @@ function Install-Dependencies {
         # Tell uv to install into our venv (no activation needed)
         $env:VIRTUAL_ENV = "$InstallDir\venv"
     }
-    
-    # Install main package with all extras
-    try {
-        & $UvCmd pip install -e ".[all]" 2>&1 | Out-Null
-    } catch {
-        & $UvCmd pip install -e "." | Out-Null
-    }
-    
-    Write-Success "Main package installed"
-    
-    # Install optional submodules
-    Write-Info "Installing tinker-atropos (RL training backend)..."
-    if (Test-Path "tinker-atropos\pyproject.toml") {
-        try {
-            & $UvCmd pip install -e ".\tinker-atropos" 2>&1 | Out-Null
-            Write-Success "tinker-atropos installed"
-        } catch {
-            Write-Warn "tinker-atropos install failed (RL tools may not work)"
+
+    # Hash-verified install (Tier 0) — when uv.lock is present, prefer
+    # `uv sync --locked`. The lockfile records SHA256 hashes for every
+    # transitive dependency, so a compromised transitive (different hash
+    # than what we shipped) is REJECTED by the resolver. This is the
+    # *only* path that protects against the "direct dep is fine, but the
+    # dep's dep got worm-poisoned overnight" failure mode. The
+    # `uv pip install` tiers below re-resolve transitives fresh from PyPI
+    # without any hash verification — they exist to keep installs working
+    # when the lockfile is stale, missing, or out-of-sync with the
+    # current extras spec, NOT because they're equivalent in posture.
+    if (Test-Path "uv.lock") {
+        Write-Info "Trying tier: hash-verified (uv.lock) ..."
+        & $UvCmd sync --all-extras --locked
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "Main package installed (hash-verified via uv.lock)"
+            $script:InstalledTier = "hash-verified (uv.lock)"
+            # Skip the rest of the tiered cascade — we already have a
+            # complete, hash-verified install.
+            $skipPipFallback = $true
+        } else {
+            Write-Warn "uv.lock sync failed (lockfile may be stale), falling back to PyPI resolve..."
+            $skipPipFallback = $false
         }
     } else {
-        Write-Warn "tinker-atropos not found (run: git submodule update --init)"
+        Write-Info "uv.lock not found — falling back to PyPI resolve (no hash verification)"
+        $skipPipFallback = $false
+    }
+
+    # Install main package.  Tiered fallback so a single flaky git+https dep
+    # (atroposlib / tinker in the [rl] extra) doesn't silently drop
+    # dashboard/MCP/cron/messaging extras.  Each tier's stdout/stderr is
+    # preserved — no Out-Null swallowing — so the user can see what failed.
+    #
+    # Tier 1: [all] — everything, including RL git+https deps (best case).
+    # Tier 2: [all] minus a small list of currently-broken extras. The
+    #         broken list is centralised in $brokenExtras below — when
+    #         a package gets quarantined / yanked / pulled, add it here
+    #         and the resolver no longer chokes on it. This is what saves
+    #         the user from silently losing 10+ unrelated extras every
+    #         time one upstream package breaks.
+    # Tier 3: [core-extras] synthesised locally — all PyPI-only extras we
+    #         ship, also minus $brokenExtras. Drops [rl] and [matrix]
+    #         (linux-only) which are the usual failure culprits.
+    # Tier 4: [web,mcp,cron,cli,messaging,dev] — the minimum we strongly
+    #         believe a user expects `hermes dashboard` / slash commands /
+    #         cron / messaging platforms to work out of the box.
+    # Tier 5: bare `.` — last-resort so at least the core CLI launches.
+
+    # Currently-broken extras. Edit this list when an upstream package
+    # gets quarantined / yanked / breaks resolution. Empty means everything
+    # in [all] should be installable; populate with the names of extras
+    # whose deps are temporarily unavailable to keep installs working
+    # for users.
+    $brokenExtras = @()
+
+    $allExtras = @(
+        "modal","daytona","vercel","messaging","matrix","cron","cli","dev",
+        "tts-premium","slack","pty","honcho","mcp","homeassistant","sms",
+        "acp","voice","dingtalk","feishu","google","bedrock","web",
+        "youtube"
+    )
+    $pypiExtras = @(
+        "web","mcp","cron","cli","voice","messaging","slack","dev","acp",
+        "pty","homeassistant","sms","tts-premium","honcho","google",
+        "bedrock","dingtalk","feishu","modal","daytona","vercel","youtube"
+    )
+    $safeAll  = ($allExtras  | Where-Object { $brokenExtras -notcontains $_ }) -join ","
+    $safePypi = ($pypiExtras | Where-Object { $brokenExtras -notcontains $_ }) -join ","
+    $brokenLabel = if ($brokenExtras) { ($brokenExtras -join ", ") } else { "none" }
+
+    $installTiers = @(
+        @{ Name = "all (with RL/matrix extras)"; Spec = ".[all]" },
+        @{ Name = "all minus known-broken ($brokenLabel)"; Spec = ".[$safeAll]" },
+        @{ Name = "PyPI-only extras (no git deps)"; Spec = ".[$safePypi]" },
+        @{ Name = "dashboard + core platforms"; Spec = ".[web,mcp,cron,cli,messaging,dev]" },
+        @{ Name = "core only (no extras)"; Spec = "." }
+    )
+    $installed = $skipPipFallback
+    if (-not $skipPipFallback) {
+        foreach ($tier in $installTiers) {
+        Write-Info "Trying tier: $($tier.Name) ..."
+        & $UvCmd pip install -e $tier.Spec
+        if ($LASTEXITCODE -eq 0) {
+            Write-Success "Main package installed ($($tier.Name))"
+            $script:InstalledTier = $tier.Name
+            $installed = $true
+            break
+        }
+        Write-Warn "Tier '$($tier.Name)' failed (exit $LASTEXITCODE). Trying next tier..."
+        }
+    }
+    if (-not $installed) {
+        throw "Failed to install hermes-agent package even with no extras. Inspect the uv pip install output above."
+    }
+
+    # Verify the dashboard deps specifically — they're the most common thing
+    # users hit and lazy-import errors from `hermes dashboard` are confusing.
+    # If tier 1 failed (the common case), [web] was still picked up by tiers
+    # 2-3; only tier 4 leaves you without it.
+    $pythonExe = if (-not $NoVenv) { "$InstallDir\venv\Scripts\python.exe" } else { (& $UvCmd python find $PythonVersion) }
+    if (Test-Path $pythonExe) {
+        $webOk = $false
+        try {
+            & $pythonExe -c "import fastapi, uvicorn" 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { $webOk = $true }
+        } catch { }
+        if (-not $webOk) {
+            Write-Warn "fastapi/uvicorn not importable — `hermes dashboard` will not work."
+            Write-Info "Attempting targeted install of [web] extra as last resort..."
+            & $UvCmd pip install -e ".[web]"
+            if ($LASTEXITCODE -eq 0) {
+                Write-Success "[web] extra installed; `hermes dashboard` should now work."
+            } else {
+                Write-Warn "Could not install [web] extra. Run manually: uv pip install --python `"$pythonExe`" `"fastapi>=0.104,<1`" `"uvicorn[standard]>=0.24,<1`""
+            }
+        }
+    }
+    
+    # tinker-atropos (RL training) is optional and OFF by default.  Matches the
+    # Linux/macOS install.sh behavior.  Reasons not to auto-install:
+    #   - tinker-atropos/pyproject.toml pulls atroposlib + tinker from git+https
+    #     (NousResearch/atropos + thinking-machines-lab/tinker) which can fail on
+    #     locked-down networks, flaky DNS, or rate-limited github.com and would
+    #     previously kill the whole install mid-flight on Windows.
+    #   - It's an RL training submodule, not part of the default agent surface.
+    #     Users who don't do RL training never need it.
+    # Users who do want it can run the one-liner we print below.
+    if (Test-Path "tinker-atropos\pyproject.toml") {
+        Write-Info "tinker-atropos submodule found — skipping install (optional, for RL training)"
+        Write-Info "  To install later: $UvCmd pip install -e `".\tinker-atropos`""
     }
     
     Pop-Location
