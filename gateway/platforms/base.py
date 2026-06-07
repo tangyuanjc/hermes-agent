@@ -2475,6 +2475,9 @@ class BasePlatformAdapter(ABC):
         network errors, sends the user a brief delivery-failure notice so they
         know to retry rather than waiting indefinitely.
         """
+        from agent.redact import redact_sensitive_text
+
+        content = redact_sensitive_text(content, force=True)
 
         result = await self.send(
             chat_id=chat_id,

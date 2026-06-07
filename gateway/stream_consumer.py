@@ -608,14 +608,16 @@ class GatewayStreamConsumer:
         stream finishes — we just need to hide the raw directives from the
         user.
         """
+        from agent.redact import redact_sensitive_text
+
         if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
-            return text
+            return redact_sensitive_text(text, force=True)
         cleaned = text.replace("[[audio_as_voice]]", "")
         cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
         # Collapse excessive blank lines left behind by removed tags
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
         # Strip trailing whitespace/newlines but preserve leading content
-        return cleaned.rstrip()
+        return redact_sensitive_text(cleaned.rstrip(), force=True)
 
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.

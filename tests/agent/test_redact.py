@@ -482,6 +482,29 @@ class TestUrlUserinfoRedaction:
         assert "dbpass" not in result
 
 
+class TestStrategicSecretMaskScenarios:
+    """CSO WS-270 acceptance cases for outbound message masking."""
+
+    @pytest.mark.parametrize(
+        ("label", "text", "must_not_contain"),
+        [
+            ("openai", "我的 OpenAI key 是 sk-xxxxxxxxxxxxxxx", "xxxxxxxx"),
+            ("anthropic", "Anthropic key: sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz123456", "AbCdEfGhIjKl"),
+            ("feishu-access", "access_token=t-abcdef1234567890&tenant=jc", "t-abcdef1234567890"),
+            ("feishu-secret", "app_secret=cli_secret_abcdef1234567890", "cli_secret_abcdef"),
+            ("postgres", "postgres://user:pass@host:5432/db", "user:pass@host"),
+            (
+                "ssh-public-key",
+                "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDcafebabecafebabecafebabe user@example",
+                "AAAAB3NzaC1yc2E",
+            ),
+        ],
+    )
+    def test_required_mask_scenarios(self, label, text, must_not_contain):
+        result = redact_sensitive_text(text, force=True)
+        assert must_not_contain not in result, label
+
+
 class TestFormBodyRedaction:
     """Form-urlencoded body redaction (k=v&k=v with no other text)."""
 

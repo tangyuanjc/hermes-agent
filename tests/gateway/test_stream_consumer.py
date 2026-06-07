@@ -84,6 +84,13 @@ class TestCleanForDisplay:
         # But "media:" is lowercase so won't match either
         assert result == text
 
+    def test_redacts_secrets_before_display(self):
+        """Streaming display text must not leak raw provider keys."""
+        raw_secret = "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz123456"
+        result = GatewayStreamConsumer._clean_for_display(f"key: {raw_secret}")
+        assert raw_secret not in result
+        assert "sk-ant" in result
+
 
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
 
@@ -1780,4 +1787,3 @@ class TestUtf16OverflowDetection:
         # auto-attr mock. Verified indirectly by all the other tests in
         # this file passing — they all use MagicMock adapters.
         assert consumer is not None
-

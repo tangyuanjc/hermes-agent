@@ -515,6 +515,30 @@ def _safe_command_preview(command: Any, limit: int = 200) -> str:
     except Exception:
         return f"<{type(command).__name__}>"
 
+
+_OUTBOUND_CLI_COMMAND_RE = re.compile(
+    r"("
+    r"\blark-cli\b(?=[\s\S]*\bim\s+\+messages-send\b)|"
+    r"\blark-cli\b(?=[\s\S]*/open-apis/im/v1/messages\b)|"
+    r"\bmultica\b\s+issue\s+(?:comment\s+add|create|update)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _mask_outbound_cli_command(command: str) -> str:
+    """Mask secrets in shell commands that publish text outside the host.
+
+    This intentionally does not rewrite arbitrary commands: local commands may
+    need raw credentials for legitimate work, while outbound notification
+    commands should never ship them to IM or Multica issue timelines.
+    """
+    if not _OUTBOUND_CLI_COMMAND_RE.search(command):
+        return command
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(command, force=True)
+
 def _looks_like_env_assignment(token: str) -> bool:
     """Return True when *token* is a leading shell environment assignment."""
     if "=" not in token or token.startswith("="):
@@ -1707,6 +1731,8 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+
+        command = _mask_outbound_cli_command(command)
 
         # Get configuration
         config = _get_env_config()

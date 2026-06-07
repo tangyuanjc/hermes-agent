@@ -23,6 +23,7 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "token",
     "api_key",
     "apikey",
+    "app_secret",
     "client_secret",
     "password",
     "auth",
@@ -45,6 +46,7 @@ _SENSITIVE_BODY_KEYS = frozenset({
     "token",
     "api_key",
     "apikey",
+    "app_secret",
     "client_secret",
     "password",
     "auth",
@@ -112,9 +114,20 @@ _ENV_ASSIGN_RE = re.compile(
 )
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|app_secret|client_secret|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
+    re.IGNORECASE,
+)
+
+# Bare CLI/API form values in outbound messages, e.g.
+# `app_secret=...` or `access_token=...`. Keep this strict (no spaces around
+# `=`) so source-code references like `api_key = config.get(...)` remain intact.
+_SENSITIVE_ASSIGN_RE = re.compile(
+    r"\b("
+    r"access_token|refresh_token|id_token|token|api_key|apikey|app_secret|"
+    r"client_secret|password|auth|jwt|secret|private_key|authorization|key"
+    r")=([^\s&#;,]+)",
     re.IGNORECASE,
 )
 
@@ -133,6 +146,14 @@ _TELEGRAM_RE = re.compile(
 # Private key blocks: -----BEGIN RSA PRIVATE KEY----- ... -----END RSA PRIVATE KEY-----
 _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
+)
+
+# SSH public keys are not private keys, but posting them into shared IM/issues
+# still leaks reusable authentication material and host/user correlation.
+_SSH_PUBLIC_KEY_RE = re.compile(
+    r"\b("
+    r"ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)"
+    r")\s+([A-Za-z0-9+/=]{20,})(\s+[^\n\r]+)?"
 )
 
 # Database connection strings: protocol://user:PASSWORD@host
@@ -308,6 +329,13 @@ def _redact_form_body(text: str) -> str:
     return _redact_query_string(text.strip())
 
 
+def _redact_sensitive_assignments(text: str) -> str:
+    return _SENSITIVE_ASSIGN_RE.sub(
+        lambda m: f"{m.group(1)}={_mask_token(m.group(2))}",
+        text,
+    )
+
+
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -362,6 +390,12 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     # Private key blocks
     text = _PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", text)
 
+    # SSH public keys
+    text = _SSH_PUBLIC_KEY_RE.sub(
+        lambda m: f"{m.group(1)} {_mask_token(m.group(2))}{m.group(3) or ''}",
+        text,
+    )
+
     # Database connection string passwords
     text = _DB_CONNSTR_RE.sub(lambda m: f"{m.group(1)}***{m.group(3)}", text)
 
@@ -377,6 +411,9 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 
     # Form-urlencoded bodies (only triggers on clean k=v&k=v inputs).
     text = _redact_form_body(text)
+
+    # Bare sensitive key=value assignments often appear in CLI/API payloads.
+    text = _redact_sensitive_assignments(text)
 
     # Discord user/role mentions (<@snowflake_id>)
     text = _DISCORD_MENTION_RE.sub(lambda m: f"<@{'!' if '!' in m.group(0) else ''}***>", text)
