@@ -2561,16 +2561,33 @@ class TestConcurrentWriteSafety:
         assert len(msgs) == 1
         assert msgs[0]["content"] == "hello after lock"
 
-    def test_sqlite_timeout_is_at_least_30s(self, db):
-        """Connection timeout should be >= 30s to survive CLI/gateway contention."""
-        # Access the underlying connection timeout via sqlite3 introspection.
-        # There is no public API, so we check the kwarg via the module default.
-        import sqlite3
+    def test_append_message_reopens_closed_connection(self, db):
+        """A stale SessionDB handle from cron/gateway cleanup must not drop flushes."""
+        db.create_session(session_id="delayed-cron", source="cron", model="gpt-test")
+        db.close()
+
+        db.append_message(
+            session_id="delayed-cron",
+            role="tool",
+            content="session_search completed after monitor timeout",
+            tool_name="session_search",
+        )
+
+        msgs = db.get_messages("delayed-cron")
+        assert len(msgs) == 1
+        assert msgs[0]["content"] == "session_search completed after monitor timeout"
+        assert msgs[0]["tool_name"] == "session_search"
+
+    def test_sqlite_timeout_uses_application_retry_policy(self, db):
+        """SQLite should fail fast so _execute_write handles jittered retries."""
         import inspect
         from hermes_state import SessionDB as _SessionDB
-        src = inspect.getsource(_SessionDB.__init__)
-        assert "30" in src, (
-            "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
+
+        open_src = inspect.getsource(_SessionDB._open_connection)
+        write_src = inspect.getsource(_SessionDB._execute_write)
+        assert "timeout=1.0" in open_src
+        assert "_WRITE_MAX_RETRIES" in write_src, (
+            "SessionDB writes should use application-level retry/jitter for lock contention"
         )
 
 
@@ -2942,4 +2959,3 @@ class TestFTS5ToolCallMigration:
             assert version == 11
         finally:
             session_db.close()
-

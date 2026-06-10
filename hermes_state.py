@@ -333,27 +333,11 @@ class SessionDB:
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._write_count = 0
+        self._conn_handle: Optional[sqlite3.Connection] = None
         try:
-            self._conn = sqlite3.connect(
-                str(self.db_path),
-                check_same_thread=False,
-                # Short timeout — application-level retry with random jitter
-                # handles contention instead of sitting in SQLite's internal
-                # busy handler for up to 30s.
-                timeout=1.0,
-                # Autocommit mode: Python's default isolation_level=""
-                # auto-starts transactions on DML, which conflicts with our
-                # explicit BEGIN IMMEDIATE.  None = we manage transactions
-                # ourselves.
-                isolation_level=None,
-            )
-            self._conn.row_factory = sqlite3.Row
-            apply_wal_with_fallback(self._conn, db_label="state.db")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-
-            self._init_schema()
+            self._open_and_init_connection()
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -369,6 +353,65 @@ class SessionDB:
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """Return an open SQLite connection, reopening after close() if needed.
+
+        Cron timeout handling can outlive the monitor thread: the monitor may
+        close its SessionDB while the worker thread is still unwinding and about
+        to flush the transcript.  Treat close() as releasing the current handle,
+        not permanently poisoning this SessionDB object.
+        """
+        conn = self._conn_handle
+        if conn is not None:
+            return conn
+        with self._lock:
+            conn = self._conn_handle
+            if conn is None:
+                try:
+                    conn = self._open_and_init_connection()
+                except Exception as exc:
+                    _set_last_init_error(f"{type(exc).__name__}: {exc}")
+                    raise
+            return conn
+
+    @_conn.setter
+    def _conn(self, conn: Optional[sqlite3.Connection]) -> None:
+        self._conn_handle = conn
+
+    def _open_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            # Short timeout — application-level retry with random jitter
+            # handles contention instead of sitting in SQLite's internal
+            # busy handler for up to 30s.
+            timeout=1.0,
+            # Autocommit mode: Python's default isolation_level=""
+            # auto-starts transactions on DML, which conflicts with our
+            # explicit BEGIN IMMEDIATE.  None = we manage transactions
+            # ourselves.
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        apply_wal_with_fallback(conn, db_label="state.db")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    def _open_and_init_connection(self) -> sqlite3.Connection:
+        conn = self._open_connection()
+        self._conn_handle = conn
+        try:
+            self._init_schema()
+        except Exception:
+            self._conn_handle = None
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        return conn
 
     # ── Core write helper ──
 
@@ -452,13 +495,14 @@ class SessionDB:
         help keep the WAL file from growing unbounded.
         """
         with self._lock:
-            if self._conn:
+            conn = self._conn_handle
+            if conn:
                 try:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                 except Exception:
                     pass
-                self._conn.close()
-                self._conn = None
+                conn.close()
+                self._conn_handle = None
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -2963,4 +3007,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-
