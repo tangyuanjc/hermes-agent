@@ -56,10 +56,12 @@ def _scan_context_content(content: str, filename: str) -> str:
     """Scan context file content for injection. Returns sanitized content."""
     findings = []
 
-    # Check invisible unicode
+    # Strip invisible unicode instead of dropping the whole context file. These
+    # characters often arrive from copy/paste in otherwise-valid org prompts.
     for char in _CONTEXT_INVISIBLE_CHARS:
         if char in content:
-            findings.append(f"invisible unicode U+{ord(char):04X}")
+            logger.warning("Context file %s stripped invisible unicode U+%04X", filename, ord(char))
+            content = content.replace(char, "")
 
     # Check threat patterns
     for pattern, pid in _CONTEXT_THREAT_PATTERNS:
@@ -821,7 +823,7 @@ def build_environment_hints() -> str:
     return "\n\n".join(hints)
 
 
-CONTEXT_FILE_MAX_CHARS = 20_000
+CONTEXT_FILE_MAX_CHARS = int(os.environ.get("HERMES_CONTEXT_FILE_MAX_CHARS", "200000"))
 CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
 CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
 
@@ -1368,6 +1370,26 @@ def _load_agents_md(cwd_path: Path) -> str:
     return ""
 
 
+def _load_canonical_org_agents_md(cwd_path: Path) -> str:
+    """Load canonical org AGENTS.md independently of project context."""
+    org_root = Path(os.environ.get("ORG_ROOT") or (Path.home() / ".org")).expanduser()
+    candidate = org_root / "AGENTS.md"
+    try:
+        if not candidate.exists() or not candidate.is_file():
+            return ""
+        if (cwd_path / "AGENTS.md").exists() and (cwd_path / "AGENTS.md").resolve() == candidate.resolve():
+            return ""
+        content = candidate.read_text(encoding="utf-8").strip()
+        if not content:
+            return ""
+        content = _scan_context_content(content, str(candidate))
+        result = f"## Canonical AGENTS.md ({candidate})\n\n{content}"
+        return _truncate_content(result, "canonical AGENTS.md")
+    except Exception as e:
+        logger.debug("Could not read canonical org AGENTS.md from %s: %s", candidate, e)
+        return ""
+
+
 def _load_claude_md(cwd_path: Path) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
@@ -1423,8 +1445,9 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
       3. CLAUDE.md / claude.md   (cwd only)
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 
-    SOUL.md from HERMES_HOME is independent and always included when present.
-    Each context source is capped at 20,000 chars.
+    Canonical ~/.org/AGENTS.md and SOUL.md from HERMES_HOME are independent
+    and always included when present. Each context source is capped by
+    CONTEXT_FILE_MAX_CHARS.
 
     When *skip_soul* is True, SOUL.md is not included here (it was already
     loaded via ``load_soul_md()`` for the identity slot).
@@ -1434,6 +1457,10 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
 
     cwd_path = Path(cwd).resolve()
     sections = []
+
+    canonical_agents = _load_canonical_org_agents_md(cwd_path)
+    if canonical_agents:
+        sections.append(canonical_agents)
 
     # Priority-based project context: first match wins
     project_context = (

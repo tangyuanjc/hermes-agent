@@ -93,9 +93,9 @@ class TestScanContextContent:
         result = _scan_context_content("cat ~/.env", "agents.md")
         assert "BLOCKED" in result
 
-    def test_invisible_unicode_blocked(self):
+    def test_invisible_unicode_stripped(self):
         result = _scan_context_content("normal text\u200b", "test.md")
-        assert "BLOCKED" in result
+        assert result == "normal text"
 
     def test_translate_execute_blocked(self):
         result = _scan_context_content(
@@ -491,6 +491,10 @@ class TestBuildNousSubscriptionPrompt:
 
 
 class TestBuildContextFilesPrompt:
+    @pytest.fixture(autouse=True)
+    def isolate_org_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ORG_ROOT", str(tmp_path / "missing_org"))
+
     def test_empty_dir_loads_seeded_global_soul(self, tmp_path):
         from unittest.mock import patch
 
@@ -506,6 +510,21 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Ruff for linting" in result
         assert "Project Context" in result
+
+    def test_loads_canonical_org_agents_in_addition_to_project_context(self, tmp_path, monkeypatch):
+        org_root = tmp_path / "org"
+        org_root.mkdir()
+        (org_root / "AGENTS.md").write_text("Canonical org constitution.", encoding="utf-8")
+        (tmp_path / "AGENTS.md").write_text("Project-specific rules.", encoding="utf-8")
+        monkeypatch.setenv("ORG_ROOT", str(org_root))
+
+        result = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+        assert "Canonical org constitution." in result
+        assert "Project-specific rules." in result
+
+    def test_context_file_limit_can_hold_full_org_constitution(self):
+        assert CONTEXT_FILE_MAX_CHARS >= 160_000
 
     def test_loads_cursorrules(self, tmp_path):
         (tmp_path / ".cursorrules").write_text("Always use type hints.")
@@ -1186,6 +1205,4 @@ class TestOpenAIModelExecutionGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
 
